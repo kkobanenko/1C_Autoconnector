@@ -1,0 +1,199 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+Role & Goal
+You are a senior 1C/MS SQL data engineer. Build a schema-aware SQL view generator that, given:
+
+the current 1C storage structure export (output of ПолучитьСтруктуруХраненияБазыДанных()),
+
+the live schema of the MS SQL database (to guard against table/column renames), and
+
+a list of target views with desired fields and naming policy,
+produces idempotent T-SQL scripts (CREATE OR ALTER VIEW) where columns are exposed with human-readable Russian names.
+
+Inputs (provide as variables/placeholders in your solution):
+
+STRUCTURE_TEXT: raw text (or JSON) of the current storage structure export.
+
+DB_CONNECTION: SQL Server connection string with read access.
+
+VIEW_SPECS: array describing each requested view. For each view:
+
+meta_object: e.g., "Документ.АктВыполненныхРабот" or "Справочник.ПрофилиГруппДоступа"
+
+part: optional tabular part name (e.g., "ТабличнаяЧасть.Услуги")
+
+columns: list of desired human names (e.g., ["Дата","Номер","Контрагент","СуммаДокумента"])
+
+enrichment: optional flags (e.g., resolve_references=true, decode_enums=true)
+
+schema: target schema for the view (default "dbo")
+
+view_name: explicit view name (if omitted, auto-generate as vw_<Meta>[_<Part>])
+
+NAMING_POLICY:
+
+column_case: "as_is" (default)
+
+ascii_duplicate_columns: true|false (if true, also add _en ASCII aliases)
+
+OUTPUT_DIR: where to write .sql files.
+
+Data you can rely on from the structure export (examples):
+
+Mapping of metadata objects → physical tables (e.g., Документ.АктВыполненныхРабот → Document515; tabular part Услуги → Document515.VT1794).
+
+Mapping of physical columns → human names (e.g., in Document515 field Fld1765 has name Контрагент; in Document513.VT1655 the column mappings include НомерСтроки, СтатьяРасходов, etc.).
+
+Directories and enums (e.g., Справочник.ПрофилиГруппДоступа → Reference298 with Description (Наименование), Code (Код); enums like Перечисление.аксТипыПравилСопоставления → Enum37180). Note: many Enum#### tables in SQL expose ID and EnumOrder only; textual captions may be unavailable—fall back to IDs unless the structure exposes caption fields.
+
+Deliverables
+
+For each VIEW_SPECS[i], a standalone T-SQL file with CREATE OR ALTER VIEW and all necessary JOINs.
+
+00_helpers.sql with shared UDFs/schemabinding safe helpers as needed.
+
+README.md summarizing: source table(s), chosen joins for references/enums, and a column map (physical → human).
+
+tests.sql with a TOP (100) sanity query from each view.
+
+Functional Requirements
+
+Parse STRUCTURE_TEXT to build dictionaries:
+
+meta_to_table: "Документ.АктВыполненныхРабот" → "Document515", "Документ.АктВыполненныхРабот.ТабличнаяЧасть.Услуги" → "Document515.VT1794".
+
+col_to_human: within each table, map ID→Ссылка, Date_Time→Дата, Number→Номер, Posted→Проведен, and FldNNNN→<Человекочитаемое> (e.g., Fld1765→Контрагент, Fld1775→СуммаДокумента).
+
+line_no detection for tabular parts (e.g., LineNo1795→НомерСтроки).
+
+Validate against live DB via INFORMATION_SCHEMA/sys to confirm each physical table/column exists; if renamed, auto-discover the closest match by table ID suffix (e.g., Document515 stays stable even if metadata evolves).
+
+Reference resolution (optional):
+
+If a field’s human name indicates a reference (e.g., Контрагент, Номенклатура, Организация) and resolve_references=true, LEFT JOIN the target table (Reference####) on target.ID = base.<field> and expose target.Description AS [<Имя> (Наименование)] and optionally target.Code. (The specific Reference#### is discovered from STRUCTURE_TEXT using the field’s type link if present; otherwise, allow a join_hints override in VIEW_SPECS.)
+
+Enum resolution (optional):
+
+If the source is Enum####, and there’s no caption column, output both ID and EnumOrder; support an optional external mapping table if provided.
+
+Safe naming: wrap Russian column names in QUOTENAME([ ]); optionally add ASCII duplicates (e.g., [Контрагент_en]) using transliteration.
+
+Idempotence & perf:
+
+Use CREATE OR ALTER VIEW schema.view AS ...
+
+Avoid scalar UDFs in the SELECT where possible; prefer inline expressions/joins.
+
+No SELECT *; list columns explicitly from the dictionary.
+
+Two flavors per view (configurable):
+
+*_raw: only physical→human aliasing, no joins.
+
+*_enriched: includes reference/enum decoding joins.
+
+Implementation Outline (suggest Python generator + T-SQL output)
+
+Step 1. Parse STRUCTURE_TEXT (DOCX or plain text). If DOCX, use python-docx; build meta_to_table and col_to_human.
+
+Step 2. Connect to SQL Server; introspect sys.tables, sys.columns to confirm existence.
+
+Step 3. For each VIEW_SPECS item:
+
+Identify base table (meta_to_table[meta_object]).
+
+If part is set, use the VT#### table mapped for that tabular part.
+
+Build a SELECT list by mapping desired human names back to physical names via col_to_human (reverse lookup).
+
+Add JOINs for references/enums as requested.
+
+Emit CREATE OR ALTER VIEW text with fully-qualified names and QUOTENAME on all identifiers.
+
+Step 4. Write files, README with a physical→human table, and a simple smoke test.
+
+Example Spec → Example SQL (show both RAW and ENRICHED)
+
+Spec:
+
+{
+  "meta_object": "Документ.АктВыполненныхРабот",
+  "columns": ["Дата","Номер","Проведен","Контрагент","СуммаДокумента"],
+  "enrichment": {"resolve_references": true},
+  "schema": "dbo",
+  "view_name": "vw_АктВыполненныхРабот_enriched"
+}
+
+
+From structure: base is Document515; columns include Date_Time(Дата), Number(Номер), Posted(Проведен), Fld1765(Контрагент), Fld1775(СуммаДокумента). Tabular part Услуги maps to Document515.VT1794 with LineNo1795 etc., available for separate detail view if needed.
+
+Generated ENRICHED view (illustrative):
+
+CREATE OR ALTER VIEW [dbo].[vw_АктВыполненныхРабот_enriched] AS
+SELECT
+    d.[ID]                 AS [Ссылка],
+    d.[Date_Time]          AS [Дата],
+    d.[Number]             AS [Номер],
+    d.[Posted]             AS [Проведен],
+    d.[Fld1775]            AS [СуммаДокумента],
+    d.[Fld1765]            AS [Контрагент (ID)],
+    c.[Description]        AS [Контрагент (Наименование)],
+    c.[Code]               AS [Контрагент (Код)]
+FROM [dbo].[Document515] AS d
+LEFT JOIN [dbo].[Reference<КонтрагентыID>] AS c
+       ON c.[ID] = d.[Fld1765];
+GO
+
+
+(Note: replace Reference<КонтрагентыID> with the actual reference table discovered from STRUCTURE_TEXT for the “Контрагент” field; if ambiguous, support a join_hints override in the spec.)
+
+Example detail view for tabular part Услуги (Document515.VT1794):
+
+CREATE OR ALTER VIEW [dbo].[vw_АктВыполненныхРабот_Услуги_raw] AS
+SELECT
+    t.[ID]                 AS [СсылкаДокумента],
+    t.[LineNo1795]         AS [НомерСтроки],
+    t.[Fld1796]            AS [Номенклатура],
+    t.[Fld1799]            AS [Количество],
+    t.[Fld1801]            AS [Цена],
+    t.[Fld1802]            AS [Сумма]
+FROM [dbo].[Document515.VT1794] AS t;
+GO
+
+
+(Add optional joins to decode Номенклатура via its Reference#### when resolve_references=true.)
+
+Another example from АвансовыйОтчет → ПрочиеРасходы: base Document513, part Document513.VT1655 with fields like НомерСтроки, СтатьяРасходов, Сумма, Контрагент, etc.—use the same pattern to build vw_АвансовыйОтчет_ПрочиеРасходы_* views.
+
+Quality/Robustness Requirements
+
+Break on missing columns with a clear message in README and keep the view minimal (omit missing fields) if strict=false.
+
+Russian identifiers must be bracketed; provide optional ASCII duplicates if enabled.
+
+No hardcoded numeric suffixes: discover Document###, Reference###, VT#### from STRUCTURE_TEXT.
+
+Performance: for large joins, avoid non-sargable expressions; prefer joining on ID (GUID).
+
+Safety: read-only; generator must not modify data.
+
+Outputs to Produce Now (given inputs):
+
+00_helpers.sql
+
+One .sql per requested view (*_raw.sql, *_enriched.sql as applicable)
+
+README.md and tests.sql
+
+Constraints & Environment
+
+SQL Server 2016+ (supports CREATE OR ALTER VIEW).
+
+Script in Python 3.10+ (or PowerShell) for portability.
+
+No 1C runtime required; rely solely on structure export + SQL metadata.
+
+Finally: After generating, print a summary table listing each view, source table(s), and columns included (human names).
