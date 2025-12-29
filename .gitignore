@@ -25,6 +25,9 @@ output/
 *.sql
 !00_helpers.sql
 
+# Input files (структура данных)
+input/
+
 # Temporary files
 *.tmp
 *.log

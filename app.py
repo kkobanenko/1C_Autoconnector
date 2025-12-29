@@ -1,0 +1,972 @@
+#!/usr/bin/env python3
+"""
+Streamlit UI приложение для генерации SQL VIEW.
+Запуск: streamlit run app.py --server.port 8512
+"""
+
+import streamlit as st
+import io
+from pathlib import Path
+import traceback
+import json
+
+from parsers.structure_parser import StructureParser
+from db.structure_analyzer import StructureAnalyzer
+from builders.relationship_builder import RelationshipBuilder
+from generators.view_generator import ViewGenerator
+from utils.db_connection import test_connection, get_connection_string_from_params
+import config
+
+
+# Настройка страницы
+st.set_page_config(
+    page_title="Генератор SQL VIEW для 1С",
+    page_icon="📊",
+    layout="wide"
+)
+
+st.title("📊 Генератор SQL VIEW для 1С")
+st.markdown("---")
+
+# Инициализация session state
+if 'connection_string' not in st.session_state:
+    st.session_state.connection_string = None
+if 'connection_tested' not in st.session_state:
+    st.session_state.connection_tested = False
+if 'generated_sql' not in st.session_state:
+    st.session_state.generated_sql = None
+if 'relationships_collected' not in st.session_state:
+    st.session_state.relationships_collected = None
+if 'table_config' not in st.session_state:
+    st.session_state.table_config = {}
+if 'graph_built' not in st.session_state:
+    st.session_state.graph_built = False
+if 'analyzer' not in st.session_state:
+    st.session_state.analyzer = None
+if 'relationship_builder' not in st.session_state:
+    st.session_state.relationship_builder = None
+if 'structure_parser' not in st.session_state:
+    st.session_state.structure_parser = None
+if 'fact_table_db' not in st.session_state:
+    st.session_state.fact_table_db = None
+
+
+# Секция подключения к БД
+st.header("🔌 Подключение к базе данных")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    db_host = st.text_input("Host", value=config.MSSQL_HOST)
+    db_database = st.text_input("Database", value=config.MSSQL_DATABASE)
+
+with col2:
+    db_username = st.text_input("Username", value=config.MSSQL_USERNAME)
+    db_password = st.text_input("Password", value=config.MSSQL_PASSWORD, type="password")
+
+if st.button("Проверить подключение"):
+    connection_string = get_connection_string_from_params(
+        db_host, db_database, db_username, db_password
+    )
+    success, message = test_connection(connection_string)
+    if success:
+        st.success(f"✅ {message}")
+        st.session_state.connection_string = connection_string
+        st.session_state.connection_tested = True
+    else:
+        st.error(f"❌ {message}")
+        st.session_state.connection_tested = False
+
+st.markdown("---")
+
+# Секция параметров генерации
+st.header("⚙️ Параметры генерации")
+
+# Выбор файла структуры
+structure_file_option = st.radio(
+    "Выберите способ загрузки файла структуры:",
+    ["Использовать файл по умолчанию", "Загрузить файл", "Указать путь"]
+)
+
+structure_file_path = None
+
+if structure_file_option == "Использовать файл по умолчанию":
+    structure_file_path = str(config.DEFAULT_STRUCTURE_FILE)
+    st.info(f"Будет использован файл: {structure_file_path}")
+elif structure_file_option == "Загрузить файл":
+    uploaded_file = st.file_uploader("Загрузите файл структуры (.docx)", type=['docx'])
+    if uploaded_file:
+        # Сохраняем во временный файл
+        temp_dir = Path(config.BASE_DIR) / "temp"
+        temp_dir.mkdir(exist_ok=True)
+        temp_file = temp_dir / uploaded_file.name
+        with open(temp_file, 'wb') as f:
+            f.write(uploaded_file.getbuffer())
+        structure_file_path = str(temp_file)
+        st.success(f"Файл загружен: {uploaded_file.name}")
+else:
+    structure_file_path = st.text_input(
+        "Путь к файлу структуры",
+        value=str(config.DEFAULT_STRUCTURE_FILE)
+    )
+
+# Поле ввода названия таблицы фактов
+fact_table = st.text_input(
+    "Название таблицы фактов",
+    value="_Document653",
+    help="Введите человеческое или техническое название таблицы"
+)
+
+# Параметры генерации
+col1, col2 = st.columns(2)
+
+with col1:
+    max_depth = st.number_input(
+        "Максимальный уровень рекурсии",
+        min_value=1,
+        max_value=10,
+        value=config.DEFAULT_MAX_DEPTH,
+        help="Количество уровней вложенности для рекурсивных JOIN"
+    )
+
+with col2:
+    fix_dates = st.checkbox(
+        "Исправлять искаженные даты",
+        value=config.DEFAULT_FIX_DATES,
+        help="Вычитать 2000 лет из дат >= 3000 года для полей datetime2(0)"
+    )
+
+# Секция выходного файла
+st.markdown("---")
+st.header("💾 Выходной файл")
+
+output_file = st.text_input(
+    "Путь к выходному SQL файлу",
+    value=str(config.DEFAULT_OUTPUT_DIR / "view.sql"),
+    help="Путь, куда будет сохранен сгенерированный SQL скрипт"
+)
+
+# Кнопка генерации
+if st.button("🚀 Сгенерировать VIEW", type="primary"):
+    # Проверки
+    if not st.session_state.connection_tested:
+        st.error("❌ Сначала проверьте подключение к базе данных!")
+    elif not fact_table:
+        st.error("❌ Укажите название таблицы фактов!")
+    elif not structure_file_path or not Path(structure_file_path).exists():
+        st.error(f"❌ Файл структуры не найден: {structure_file_path}")
+    else:
+        # Очищаем предыдущие результаты
+        st.session_state.generated_sql = None
+        
+        # Создаем progress bar
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        try:
+            # Этап 1: Загрузка структуры из .docx (0-20%)
+            status_text.text("Этап 1/5: Загрузка структуры из .docx...")
+            progress_bar.progress(10)
+            
+            structure_parser = StructureParser(structure_file_path)
+            structure_data = structure_parser.parse()
+            
+            # Сохраняем результаты парсинга в JSON
+            json_path = structure_parser.save_to_json()
+            st.info(f"Результаты парсинга сохранены в: {json_path}")
+            
+            progress_bar.progress(20)
+            
+            # Этап 2: Подключение к БД и анализ структуры (20-40%)
+            status_text.text("Этап 2/5: Подключение к БД и анализ структуры...")
+            progress_bar.progress(30)
+            
+            analyzer = StructureAnalyzer(st.session_state.connection_string)
+            analyzer.connect()
+            
+            progress_bar.progress(40)
+            
+            # Этап 3: Построение графа связей (40-70%)
+            status_text.text("Этап 3/5: Построение индекса GUID и графа связей...")
+            progress_bar.progress(50)
+            
+            relationship_builder = RelationshipBuilder(analyzer)
+            # Определяем техническое имя таблицы для построения графа
+            # Используем временный парсер для разрешения имени
+            from parsers.structure_parser import StructureParser
+            temp_parser = StructureParser(structure_file_path)
+            temp_parser.parse()
+            fact_table_db = None
+            if fact_table.startswith('_'):
+                fact_table_db = fact_table
+            else:
+                fact_table_db = temp_parser.get_table_db_name(fact_table) or fact_table
+            # Строим граф только для нужной таблицы для ускорения
+            relationship_builder.build_relationship_graph([fact_table_db])
+            
+            progress_bar.progress(70)
+            
+            # Сохраняем состояние для стадии выбора таблиц
+            st.session_state.analyzer = analyzer
+            st.session_state.relationship_builder = relationship_builder
+            st.session_state.structure_parser = structure_parser
+            st.session_state.fact_table_db = fact_table_db
+            st.session_state.fact_table_input = fact_table
+            st.session_state.max_depth_saved = max_depth
+            st.session_state.fix_dates_saved = fix_dates
+            st.session_state.output_file_saved = output_file
+            st.session_state.graph_built = True
+            
+            # Этап 3.5: Сбор всех связей для отображения пользователю
+            status_text.text("Этап 3.5/6: Сбор информации о связях...")
+            progress_bar.progress(75)
+            
+            view_generator_temp = ViewGenerator(
+                analyzer,
+                relationship_builder,
+                structure_parser,
+                fix_dates=fix_dates
+            )
+            
+            relationships = view_generator_temp.collect_all_relationships(fact_table, max_depth=max_depth)
+            
+            # Сохраняем данные в session_state ПЕРЕД st.stop()
+            st.session_state.relationships_collected = relationships
+            
+            # Инициализируем конфигурацию по умолчанию (все связи включены, LEFT JOIN)
+            # Очищаем старую конфигурацию при новом построении графа
+            st.session_state.table_config = {}
+            for rel in relationships:
+                st.session_state.table_config[rel['relationship_key']] = {
+                    'enabled': True,
+                    'join_type': 'LEFT JOIN'
+                }
+            
+            progress_bar.progress(80)
+            status_text.text(f"✅ Граф связей построен. Найдено {len(relationships)} связей. Перейдите к разделу 'Выбор присоединяемых таблиц' для настройки.")
+            
+            # Перезагружаем страницу, чтобы показать секцию выбора таблиц
+            # После st.rerun() страница перезагрузится и покажет секцию выбора таблиц
+            st.rerun()
+            
+        except Exception as e:
+            progress_bar.progress(0)
+            status_text.text(f"❌ Ошибка: {str(e)}")
+            st.error(f"Ошибка при генерации:\n```\n{traceback.format_exc()}\n```")
+            if 'analyzer' in locals():
+                try:
+                    analyzer.close()
+                except:
+                    pass
+
+st.markdown("---")
+
+# Секция поиска связей к таблице (информационная, только для просмотра)
+if st.session_state.get('graph_built') and st.session_state.get('fact_table_db'):
+    # Проверяем, собраны ли связи для отображения
+    if 'all_relationships_for_display' not in st.session_state:
+        # Собираем все связи (прямые и обратные) для отображения
+        try:
+            if (st.session_state.relationship_builder and 
+                st.session_state.structure_parser and 
+                st.session_state.fact_table_db):
+                all_relationships = st.session_state.relationship_builder.collect_all_relationships_for_display(
+                    st.session_state.fact_table_db,
+                    st.session_state.structure_parser
+                )
+                st.session_state.all_relationships_for_display = all_relationships
+        except Exception as e:
+            st.session_state.all_relationships_for_display = []
+    
+    # Отображаем раздел поиска связей
+    if st.session_state.get('all_relationships_for_display'):
+        st.header("🔍 Поиск связей к таблице")
+        st.info("Информация о всех связях (прямых и обратных) с базовой таблицей. Раздел только для просмотра.")
+        
+        all_rels = st.session_state.all_relationships_for_display
+        
+        # Разделяем на прямые и обратные связи
+        forward_rels = [r for r in all_rels if r.get('direction') == 'forward']
+        reverse_rels = [r for r in all_rels if r.get('direction') == 'reverse']
+        
+        st.write(f"**Найдено связей: {len(all_rels)}** (прямых: {len(forward_rels)}, обратных: {len(reverse_rels)})")
+        
+        # Функция для отображения связи только для просмотра
+        def render_relationship_for_display(rel, indent_level=0, number_path=None):
+            """Отображает связь только для просмотра (без интерактивных элементов)."""
+            rel_key = rel['relationship_key']
+            
+            # Инициализируем путь нумерации если не передан
+            if number_path is None:
+                number_path = []
+            
+            # Получаем человеческие названия таблиц
+            source_human = st.session_state.structure_parser.get_table_human_name(rel['source_table']) or rel['source_table']
+            target_human = st.session_state.structure_parser.get_table_human_name(rel['target_table']) or rel['target_table']
+            
+            # Получаем человеческое название поля
+            field_name = rel['field_name']
+            field_human = None
+            
+            # Пробуем разные варианты имени поля
+            variants_to_check = [field_name]
+            
+            # Вариант 1: Точное совпадение
+            field_human = st.session_state.structure_parser.get_field_human_name(rel['source_table'], field_name)
+            
+            # Вариант 2: Без суффикса RRef или RRRef
+            if not field_human:
+                if field_name.endswith('RRRef'):
+                    variants_to_check.append(field_name[:-6])
+                    variants_to_check.append(field_name[:-5])
+                elif field_name.endswith('RRef'):
+                    variants_to_check.append(field_name[:-4])
+                    if field_name.startswith('_'):
+                        variants_to_check.append(field_name[1:-4])
+            
+            # Вариант 3: С/без подчеркивания
+            if not field_human:
+                if not field_name.startswith('_'):
+                    variants_to_check.append('_' + field_name)
+                    if field_name.endswith('RRef'):
+                        variants_to_check.append('_' + field_name[:-4])
+                else:
+                    variants_to_check.append(field_name.lstrip('_'))
+                    if field_name.endswith('RRef'):
+                        variants_to_check.append(field_name.lstrip('_')[:-4])
+            
+            # Вариант 4: Без подчеркивания и без суффикса
+            field_name_clean = field_name.lstrip('_')
+            if field_name_clean.endswith('RRRef'):
+                base_field = field_name_clean[:-6]
+                variants_to_check.append(base_field)
+                variants_to_check.append('_' + base_field)
+            elif field_name_clean.endswith('RRef'):
+                base_field = field_name_clean[:-4]
+                variants_to_check.append(base_field)
+                variants_to_check.append('_' + base_field)
+            
+            # Пробуем каждый вариант
+            for variant in variants_to_check:
+                if variant:
+                    field_human = st.session_state.structure_parser.get_field_human_name(rel['source_table'], variant)
+                    if field_human:
+                        break
+            
+            if not field_human:
+                field_human = field_name
+            
+            # Формируем строку нумерации
+            number_str = '.'.join(map(str, number_path)) if number_path else ''
+            
+            indent = "  " * indent_level
+            
+            # Строка 1: Нумерация и источник → цель
+            col1, col2 = st.columns([1, 11])
+            with col1:
+                if number_str:
+                    st.markdown(f"**{number_str}**")
+                else:
+                    st.empty()
+            with col2:
+                if indent_level > 0:
+                    st.markdown(f"{indent}└─ **{target_human}**")
+                else:
+                    st.markdown(f"**{source_human}** → **{target_human}**")
+            
+            # Строка 2: Поле
+            col1, col2 = st.columns([1, 11])
+            with col1:
+                st.empty()
+            with col2:
+                if field_human != field_name:
+                    st.caption(f"{indent}Поле: **{field_human}** (`{field_name}`)")
+                else:
+                    st.caption(f"{indent}Поле: `{field_name}`")
+            
+            # Строка 3: Алиас и таблица
+            col1, col2 = st.columns([1, 11])
+            with col1:
+                st.empty()
+            with col2:
+                # Для обратных связей показываем информацию об исходной таблице
+                if rel.get('direction') == 'reverse':
+                    st.caption(f"{indent}Алиас источника: `{rel['source_alias']}` | Таблица источника: `{rel['source_table']}`")
+                else:
+                    st.caption(f"{indent}Алиас: `{rel['target_alias']}` | Таблица: `{rel['target_table']}`")
+        
+        # Отображаем прямые связи
+        if forward_rels:
+            st.subheader("Прямые связи (базовая таблица → другие таблицы)")
+            for idx, rel in enumerate(forward_rels, start=1):
+                render_relationship_for_display(rel, indent_level=0, number_path=[idx])
+                if idx < len(forward_rels):
+                    st.divider()
+        
+        # Отображаем обратные связи
+        if reverse_rels:
+            st.subheader("Обратные связи (другие таблицы → базовая таблица)")
+            for idx, rel in enumerate(reverse_rels, start=1):
+                render_relationship_for_display(rel, indent_level=0, number_path=[idx])
+                if idx < len(reverse_rels):
+                    st.divider()
+        
+        st.markdown("---")
+
+# Секция выбора присоединяемых таблиц
+# Проверяем наличие данных для отображения графа
+# Добавляем отладочную информацию
+debug_info = st.expander("🔍 Отладочная информация (для диагностики)")
+with debug_info:
+    st.write(f"graph_built: {st.session_state.get('graph_built')}")
+    st.write(f"relationships_collected: {st.session_state.get('relationships_collected') is not None}")
+    if st.session_state.get('relationships_collected'):
+        st.write(f"Количество связей: {len(st.session_state.relationships_collected)}")
+    else:
+        st.write("relationships_collected is None или пустой")
+
+if st.session_state.get('graph_built') and st.session_state.get('relationships_collected'):
+    relationships = st.session_state.relationships_collected
+    
+    # Проверяем, что relationships не пустой
+    if relationships and len(relationships) > 0:
+        st.header("🔗 Выбор присоединяемых таблиц")
+        st.info("Настройте, какие таблицы будут присоединены к представлению и какой тип JOIN использовать.")
+        
+        st.write(f"**Найдено связей: {len(relationships)}**")
+        
+        # Функции для сохранения и загрузки настроек
+        def save_table_config_to_file(file_path: str):
+            """Сохраняет настройки таблиц в JSON файл.
+            
+            Формат сохраняемого файла:
+            {
+                "table_config": {
+                    "relationship_key": {
+                        "enabled": true/false,
+                        "join_type": "LEFT JOIN" | "INNER JOIN" | "RIGHT JOIN"
+                    },
+                    ...
+                },
+                "fact_table": "название таблицы фактов",
+                "max_depth": 5,
+                "fix_dates": true/false
+            }
+            """
+            try:
+                config_data = {
+                    'table_config': st.session_state.table_config,
+                    'fact_table': st.session_state.get('fact_table_input', ''),
+                    'max_depth': st.session_state.get('max_depth_saved', 5),
+                    'fix_dates': st.session_state.get('fix_dates_saved', True)
+                }
+                output_path = Path(file_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    json.dump(config_data, f, ensure_ascii=False, indent=2)
+                return True
+            except Exception as e:
+                st.error(f"Ошибка при сохранении настроек: {str(e)}")
+                return False
+        
+        def load_table_config_from_file(uploaded_file=None, file_path: str = None) -> bool:
+            """Загружает настройки таблиц из JSON файла.
+            
+            Args:
+                uploaded_file: Загруженный файл через file_uploader (опционально)
+                file_path: Путь к файлу на диске (опционально)
+            
+            Returns:
+                True если загрузка успешна, False в противном случае
+            """
+            try:
+                # Определяем источник данных
+                if uploaded_file is not None:
+                    # Читаем из загруженного файла
+                    content = uploaded_file.read()
+                    config_data = json.loads(content.decode('utf-8'))
+                elif file_path:
+                    # Читаем из файла на диске
+                    file_path_obj = Path(file_path)
+                    if not file_path_obj.exists():
+                        st.error(f"Файл не найден: {file_path}")
+                        return False
+                    with open(file_path_obj, 'r', encoding='utf-8') as f:
+                        config_data = json.load(f)
+                else:
+                    st.error("Не указан источник данных для загрузки")
+                    return False
+                
+                # Проверяем структуру данных
+                if 'table_config' not in config_data:
+                    st.error("Неверный формат файла настроек: отсутствует 'table_config'")
+                    return False
+                
+                # Загружаем настройки
+                loaded_config = config_data['table_config']
+                
+                # Обновляем table_config в session_state
+                # Важно: обновляем только те связи, которые есть в загруженном файле
+                # Остальные связи остаются с текущими настройками
+                for rel_key, config_item in loaded_config.items():
+                    if rel_key in st.session_state.table_config:
+                        # Обновляем существующую связь
+                        st.session_state.table_config[rel_key].update(config_item)
+                    else:
+                        # Добавляем новую связь (если она появилась)
+                        st.session_state.table_config[rel_key] = config_item
+                    
+                    checkbox_key = f"enabled_{rel_key}"
+                    
+                    # Обновляем состояние чекбокса
+                    st.session_state[checkbox_key] = config_item.get('enabled', True)
+                    
+                    # Обновляем состояние selectbox для типа JOIN
+                    join_type_key = f"join_type_{rel_key}"
+                    join_type_value = config_item.get('join_type', 'LEFT JOIN')
+                    st.session_state[join_type_key] = join_type_value
+                    
+                    # Тип JOIN уже обновлен в table_config и в session_state для selectbox
+                
+                return True
+            except json.JSONDecodeError as e:
+                st.error(f"Ошибка при чтении JSON файла: {str(e)}")
+                return False
+            except Exception as e:
+                st.error(f"Ошибка при загрузке настроек: {str(e)}")
+                return False
+        
+        # UI для сохранения и загрузки настроек
+        st.subheader("💾 Сохранение и загрузка настроек")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**Сохранить текущие настройки:**")
+            config_save_path = st.text_input(
+                "Путь к файлу для сохранения настроек",
+                value="/home/kobanenkokn/Curproject05_1cViews/config/table_config.json",
+                key="config_save_path"
+            )
+            if st.button("💾 Сохранить настройки", type="secondary"):
+                if save_table_config_to_file(config_save_path):
+                    st.success(f"✅ Настройки успешно сохранены в файл: {config_save_path}")
+        
+        with col2:
+            st.write("**Загрузить сохраненные настройки:**")
+            
+            # Вариант 1: Загрузка через file_uploader
+            uploaded_config_file = st.file_uploader(
+                "Выберите файл с настройками",
+                type=['json'],
+                key="config_uploader",
+                help="Выберите JSON файл с ранее сохраненными настройками"
+            )
+            # Проверяем, что файл был загружен и еще не обработан
+            if uploaded_config_file is not None:
+                # Используем уникальный ключ для отслеживания загруженного файла
+                file_id_key = f"config_file_id_{uploaded_config_file.file_id}"
+                if file_id_key not in st.session_state or st.session_state[file_id_key] != uploaded_config_file.file_id:
+                    if load_table_config_from_file(uploaded_file=uploaded_config_file):
+                        st.session_state[file_id_key] = uploaded_config_file.file_id
+                        st.success("✅ Настройки успешно загружены!")
+                        st.rerun()  # Перезагружаем страницу для применения настроек
+            
+            # Вариант 2: Загрузка по пути к файлу
+            st.write("**Или укажите путь к файлу:**")
+            config_load_path = st.text_input(
+                "Путь к файлу с настройками",
+                value="/home/kobanenkokn/Curproject05_1cViews/config/table_config.json",
+                key="config_load_path"
+            )
+            if st.button("📂 Загрузить настройки из файла", type="secondary"):
+                if load_table_config_from_file(file_path=config_load_path):
+                    st.success("✅ Настройки успешно загружены!")
+                    st.rerun()  # Перезагружаем страницу для применения настроек
+        
+        st.divider()
+        
+        # Строим дерево связей: для каждой связи находим её дочерние связи
+        # Ключ: relationship_key родителя, значение: список дочерних relationship_key
+        children_map = {}
+        root_relationships = []  # Связи первого уровня (depth=1)
+        
+        for rel in relationships:
+            rel_key = rel['relationship_key']
+            source_table = rel['source_table']
+            source_alias = rel['source_alias']
+            depth = rel['depth']
+            
+            # Если это связь первого уровня, добавляем в корневые
+            if depth == 1:
+                root_relationships.append(rel)
+            
+            # Находим дочерние связи (те, у которых source_table и source_alias совпадают с target_table и target_alias текущей связи)
+            children = []
+            for child_rel in relationships:
+                if (child_rel['source_table'] == rel['target_table'] and 
+                    child_rel['source_alias'] == rel['target_alias'] and
+                    child_rel['depth'] == depth + 1):
+                    children.append(child_rel)
+            
+            if children:
+                children_map[rel_key] = children
+        
+        # Функция для рекурсивного отключения дочерних связей
+        def disable_children(parent_key):
+            """Отключает все дочерние связи рекурсивно."""
+            if parent_key in children_map:
+                for child_rel in children_map[parent_key]:
+                    child_key = child_rel['relationship_key']
+                    # Обновляем конфигурацию
+                    if child_key in st.session_state.table_config:
+                        st.session_state.table_config[child_key]['enabled'] = False
+                    # Обновляем состояние чекбокса в session_state
+                    checkbox_key = f"enabled_{child_key}"
+                    if checkbox_key in st.session_state:
+                        st.session_state[checkbox_key] = False
+                    # Рекурсивно отключаем дочерние связи
+                    disable_children(child_key)
+        
+        # Функция для рекурсивного отображения связей
+        def render_relationship(rel, indent_level=0, number_path=None):
+            """Рекурсивно отображает связь и её дочерние связи.
+            
+            Args:
+                rel: Словарь с информацией о связи
+                indent_level: Уровень вложенности для отступов
+                number_path: Список номеров для многоуровневой нумерации (например, [1, 2, 3])
+            """
+            rel_key = rel['relationship_key']
+            
+            # Инициализируем путь нумерации если не передан
+            if number_path is None:
+                number_path = []
+            
+            # Получаем человеческие названия таблиц
+            source_human = st.session_state.structure_parser.get_table_human_name(rel['source_table']) or rel['source_table']
+            target_human = st.session_state.structure_parser.get_table_human_name(rel['target_table']) or rel['target_table']
+            
+            # Получаем человеческое название поля - пробуем разные варианты
+            field_name = rel['field_name']
+            field_human = None
+            
+            # Список вариантов для проверки
+            variants_to_check = []
+            
+            # Вариант 1: Точное совпадение
+            variants_to_check.append(field_name)
+            
+            # Вариант 2: Без суффикса RRef или RRRef
+            if field_name.endswith('RRRef'):
+                variants_to_check.append(field_name[:-6])  # Убираем 'RRRef' (6 символов)
+                variants_to_check.append(field_name[:-5])   # Убираем 'RRef' (5 символов, если было опечатка)
+            elif field_name.endswith('RRef'):
+                variants_to_check.append(field_name[:-4])   # Убираем 'RRef' (4 символа) - это _Fld10028
+                # Также пробуем вариант без подчеркивания и без RRef (важно!)
+                if field_name.startswith('_'):
+                    variants_to_check.append(field_name[1:-4])  # Убираем '_' в начале и 'RRef' в конце - это Fld10028
+            
+            # Вариант 3: С подчеркиванием в начале (если не было)
+            if not field_name.startswith('_'):
+                variants_to_check.append('_' + field_name)
+                # Также пробуем с подчеркиванием и без RRef
+                if field_name.endswith('RRef'):
+                    variants_to_check.append('_' + field_name[:-4])  # Убираем 'RRef' (4 символа)
+            else:
+                variants_to_check.append(field_name.lstrip('_'))
+                # Также пробуем без подчеркивания и без RRef
+                if field_name.endswith('RRef'):
+                    variants_to_check.append(field_name.lstrip('_')[:-4])  # Убираем 'RRef' (4 символа)
+            
+            # Вариант 4: Без подчеркивания и без суффикса (комбинация)
+            # Это самый важный вариант - в структуре поля часто сохранены без подчеркивания и без RRef
+            field_name_clean = field_name.lstrip('_')
+            if field_name_clean.endswith('RRRef'):
+                base_field = field_name_clean[:-6]
+                variants_to_check.append(base_field)  # Без подчеркивания и без RRRef
+                variants_to_check.append('_' + base_field)  # С подчеркиванием, без RRRef
+            elif field_name_clean.endswith('RRef'):
+                base_field = field_name_clean[:-4]  # Убираем 'RRef' (4 символа) - это Fld10028
+                variants_to_check.append(base_field)  # Без подчеркивания и без RRef (важно! это Fld10028)
+                variants_to_check.append('_' + base_field)  # С подчеркиванием, без RRef
+            
+            # Убираем дубликаты, сохраняя порядок
+            seen = set()
+            unique_variants = []
+            for variant in variants_to_check:
+                if variant and variant not in seen:
+                    seen.add(variant)
+                    unique_variants.append(variant)
+            
+            # Пробуем каждый вариант
+            for variant in unique_variants:
+                field_human = st.session_state.structure_parser.get_field_human_name(rel['source_table'], variant)
+                if field_human:
+                    break
+            
+            # Если человеческое название не найдено, используем техническое
+            if not field_human:
+                field_human = field_name
+            
+            # Формируем строку нумерации
+            number_str = '.'.join(map(str, number_path)) if number_path else ''
+            
+            # Инициализируем конфигурацию если нужно
+            if rel_key not in st.session_state.table_config:
+                st.session_state.table_config[rel_key] = {
+                    'enabled': True,
+                    'join_type': 'LEFT JOIN'
+                }
+            
+            # Получаем текущее состояние из конфигурации
+            config = st.session_state.table_config[rel_key]
+            enabled = config.get('enabled', True)
+            
+            # Инициализируем ключ чекбокса в session_state из конфигурации
+            checkbox_key = f"enabled_{rel_key}"
+            if checkbox_key not in st.session_state:
+                st.session_state[checkbox_key] = enabled
+            else:
+                # Синхронизируем состояние чекбокса с конфигурацией
+                st.session_state[checkbox_key] = enabled
+            
+            # Проверяем, есть ли дочерние связи
+            has_children = rel_key in children_map and len(children_map[rel_key]) > 0
+            
+            # Компактный дизайн: 3 строки
+            indent = "  " * indent_level  # Отступ для вложенности
+            
+            # Строка 1: Нумерация, чекбокс, источник → цель, тип JOIN
+            col1, col2, col3, col4 = st.columns([1, 0.5, 5, 2])
+            
+            with col1:
+                # Отображаем нумерацию
+                if number_str:
+                    st.markdown(f"**{number_str}**")
+                else:
+                    st.empty()
+            
+            with col2:
+                # Чекбокс для включения/отключения связи
+                # Используем on_change callback для обработки изменений
+                checkbox_key = f"enabled_{rel_key}"
+                
+                # Инициализируем ключ чекбокса в session_state из конфигурации
+                if checkbox_key not in st.session_state:
+                    st.session_state[checkbox_key] = enabled
+                else:
+                    # Синхронизируем состояние чекбокса с конфигурацией
+                    st.session_state[checkbox_key] = enabled
+                
+                def on_checkbox_change():
+                    """Обработчик изменения чекбокса."""
+                    current_value = st.session_state[checkbox_key]
+                    st.session_state.table_config[rel_key]['enabled'] = current_value
+                    # Если отключили, отключаем все дочерние связи
+                    if not current_value:
+                        disable_children(rel_key)
+                
+                st.checkbox(
+                    "",
+                    value=enabled,
+                    key=checkbox_key,
+                    label_visibility="collapsed",
+                    on_change=on_checkbox_change
+                )
+            
+            with col3:
+                # Компактное отображение: источник → цель через поле
+                if indent_level > 0:
+                    st.markdown(f"{indent}└─ **{target_human}**")
+                else:
+                    st.markdown(f"**{source_human}** → **{target_human}**")
+            
+            with col4:
+                # Выбор типа JOIN
+                join_type_key = f"join_type_{rel_key}"
+                # Получаем значение из session_state, если оно есть, иначе из config
+                if join_type_key in st.session_state:
+                    current_join_type = st.session_state[join_type_key]
+                else:
+                    current_join_type = config.get('join_type', 'LEFT JOIN')
+                    st.session_state[join_type_key] = current_join_type
+                
+                join_type = st.selectbox(
+                    "Тип JOIN",
+                    ["LEFT JOIN", "INNER JOIN", "RIGHT JOIN"],
+                    index=["LEFT JOIN", "INNER JOIN", "RIGHT JOIN"].index(current_join_type),
+                    key=join_type_key,
+                    disabled=not enabled,
+                    label_visibility="collapsed"
+                )
+                # Обновляем конфигурацию при изменении
+                st.session_state.table_config[rel_key]['join_type'] = join_type
+            
+            # Строка 2: Поле (человеческое и техническое название)
+            col1, col2, col3 = st.columns([1, 0.5, 10.5])
+            with col1:
+                st.empty()  # Пустое место для выравнивания с нумерацией
+            with col2:
+                st.empty()  # Пустое место для выравнивания с чекбоксом
+            with col3:
+                # Всегда показываем человеческое название, если оно отличается от технического
+                # Проверяем, что человеческое название действительно найдено (не равно техническому)
+                if field_human and field_human != rel['field_name']:
+                    st.caption(f"{indent}Поле: **{field_human}** (`{rel['field_name']}`)")
+                else:
+                    # Если человеческое название не найдено, показываем только техническое
+                    st.caption(f"{indent}Поле: `{rel['field_name']}`")
+            
+            # Строка 3: Техническая информация (алиас и таблица)
+            col1, col2, col3 = st.columns([1, 0.5, 10.5])
+            with col1:
+                st.empty()  # Пустое место для выравнивания с нумерацией
+            with col2:
+                st.empty()  # Пустое место для выравнивания с чекбоксом
+            with col3:
+                st.caption(f"{indent}Алиас: `{rel['target_alias']}` | Таблица: `{rel['target_table']}`")
+            
+            # Если есть дочерние связи и текущая связь включена, показываем их
+            if has_children and enabled:
+                # Подсчитываем количество включенных дочерних связей
+                enabled_children_count = sum(
+                    1 for child_rel in children_map[rel_key]
+                    if st.session_state.table_config.get(child_rel['relationship_key'], {}).get('enabled', True)
+                )
+                
+                # Используем ключ для отслеживания состояния раскрытия
+                expand_key = f"expand_{rel_key}"
+                if expand_key not in st.session_state:
+                    st.session_state[expand_key] = False
+                
+                # Кнопка для раскрытия/сворачивания дочерних связей
+                col1, col2, col3 = st.columns([1, 0.5, 10.5])
+                with col1:
+                    st.empty()  # Пустое место для выравнивания с нумерацией
+                with col2:
+                    st.empty()  # Пустое место для выравнивания с чекбоксом
+                with col3:
+                    expand_label = f"{indent}📂 {'▼' if st.session_state[expand_key] else '▶'} Показать дочерние связи ({enabled_children_count}/{len(children_map[rel_key])})"
+                    if st.button(expand_label, key=f"btn_{rel_key}", use_container_width=False):
+                        st.session_state[expand_key] = not st.session_state[expand_key]
+                        st.rerun()
+                
+                # Показываем дочерние связи если раскрыто
+                if st.session_state[expand_key]:
+                    for idx, child_rel in enumerate(children_map[rel_key], start=1):
+                        # Формируем новый путь нумерации: добавляем номер текущей дочерней связи
+                        child_number_path = number_path + [idx]
+                        render_relationship(child_rel, indent_level + 1, child_number_path)
+            
+            # Разделитель между связями
+            if indent_level == 0:
+                st.divider()
+        
+        # Отображаем только связи первого уровня
+        st.subheader("Уровень 1")
+        for idx, rel in enumerate(root_relationships, start=1):
+            render_relationship(rel, indent_level=0, number_path=[idx])
+        
+        # Кнопка для продолжения генерации
+        if st.button("🚀 Сгенерировать VIEW с учетом настроек", type="primary"):
+            # Проверяем, что все необходимые данные сохранены
+            if (st.session_state.analyzer and 
+                st.session_state.relationship_builder and 
+                st.session_state.structure_parser and 
+                st.session_state.fact_table_db):
+                
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                try:
+                    # Этап 4: Генерация SQL VIEW с учетом настроек (80-95%)
+                    status_text.text("Этап 4/5: Генерация SQL VIEW с учетом настроек...")
+                    progress_bar.progress(80)
+                    
+                    view_generator = ViewGenerator(
+                        st.session_state.analyzer,
+                        st.session_state.relationship_builder,
+                        st.session_state.structure_parser,
+                        fix_dates=st.session_state.fix_dates_saved
+                    )
+                    
+                    # Используем сохраненные параметры
+                    fact_table_input = st.session_state.fact_table_input
+                    max_depth_use = st.session_state.max_depth_saved
+                    fix_dates_use = st.session_state.fix_dates_saved
+                    
+                    sql = view_generator.generate_view(
+                        fact_table_input, 
+                        max_depth=max_depth_use,
+                        table_config=st.session_state.table_config
+                    )
+                    
+                    progress_bar.progress(95)
+                    
+                    # Этап 5: Завершение и сохранение (95-100%)
+                    status_text.text("Этап 5/5: Сохранение результата...")
+                    
+                    # Сохраняем в файл
+                    output_path = Path(st.session_state.output_file_saved)
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        f.write(sql)
+                    
+                    # Сохраняем в session state
+                    st.session_state.generated_sql = sql
+                    
+                    progress_bar.progress(100)
+                    status_text.text("✅ Генерация завершена успешно!")
+                    
+                    # Закрываем соединение с БД
+                    if st.session_state.analyzer:
+                        try:
+                            st.session_state.analyzer.close()
+                        except:
+                            pass
+                    
+                    st.success("✅ SQL VIEW успешно сгенерирован с учетом ваших настроек!")
+                    st.rerun()
+                    
+                except Exception as e:
+                    progress_bar.progress(0)
+                    status_text.text(f"❌ Ошибка: {str(e)}")
+                    st.error(f"Ошибка при генерации:\n```\n{traceback.format_exc()}\n```")
+
+st.markdown("---")
+
+# Секция результатов
+st.header("📋 Результаты")
+
+if st.session_state.get('generated_sql'):
+    st.success("✅ SQL VIEW успешно сгенерирован!")
+    
+    # Предпросмотр SQL
+    st.subheader("Предпросмотр SQL")
+    st.code(st.session_state.generated_sql, language='sql')
+    
+    # Кнопка скачивания
+    sql_bytes = st.session_state.generated_sql.encode('utf-8')
+    st.download_button(
+        label="📥 Скачать SQL файл",
+        data=sql_bytes,
+        file_name=Path(output_file).name if output_file else "view.sql",
+        mime="text/sql"
+    )
+    
+    # Информация о файле
+    if output_file and Path(output_file).exists():
+        file_size = Path(output_file).stat().st_size
+        st.info(f"Файл сохранен: {output_file} ({file_size} байт)")
+else:
+    st.info("Результаты будут отображены здесь после генерации.")
+
+# Секция логов (опционально)
+with st.expander("📝 Логи процесса"):
+    if st.session_state.get('generated_sql'):
+        st.success("Генерация выполнена успешно")
+        st.code(st.session_state.generated_sql[:500] + "..." if len(st.session_state.generated_sql) > 500 else st.session_state.generated_sql)
+    else:
+        st.info("Логи будут отображены после генерации")
+
