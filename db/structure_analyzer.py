@@ -29,6 +29,7 @@ class StructureAnalyzer:
         self._primary_keys_cache: Dict[str, List[str]] = {}
         self._foreign_keys_cache: Dict[str, List[Dict]] = {}
         self._guid_to_table_cache: Optional[Dict[bytes, str]] = None  # Кэш GUID -> таблица
+        self._distinct_count_cache: Dict[str, int] = {}  # Кэш количества уникальных значений
     
     def connect(self):
         """Подключается к базе данных."""
@@ -598,4 +599,40 @@ class StructureAnalyzer:
         Полезно для перестроения индекса с новой логикой.
         """
         self._guid_to_table_cache = None
+    
+    def get_distinct_count(self, table_name: str, field_name: str) -> int:
+        """
+        Получает количество уникальных значений в поле таблицы.
+        
+        Args:
+            table_name: Имя таблицы
+            field_name: Имя поля
+            
+        Returns:
+            Количество уникальных значений (0 в случае ошибки)
+        """
+        # Кэширование результатов
+        cache_key = f"{table_name}|{field_name}"
+        if cache_key in self._distinct_count_cache:
+            return self._distinct_count_cache[cache_key]
+        
+        try:
+            self.connect()
+            schema, table = self._parse_table_name(table_name)
+            cursor = self.conn.cursor()
+            
+            # Экранируем имена для безопасности
+            query = f"SELECT COUNT(DISTINCT [{field_name}]) FROM [{schema}].[{table}]"
+            cursor.execute(query)
+            result = cursor.fetchone()[0]
+            cursor.close()
+            
+            count = result if result is not None else 0
+            self._distinct_count_cache[cache_key] = count
+            return count
+        except Exception as e:
+            # В случае ошибки возвращаем 0 (консервативный подход)
+            # Не логируем ошибку, чтобы не засорять вывод
+            self._distinct_count_cache[cache_key] = 0
+            return 0
 

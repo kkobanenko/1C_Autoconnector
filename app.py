@@ -233,17 +233,59 @@ if st.button("🚀 Сгенерировать VIEW", type="primary"):
             # Сохраняем данные в session_state ПЕРЕД st.stop()
             st.session_state.relationships_collected = relationships
             
-            # Инициализируем конфигурацию по умолчанию (все связи включены, LEFT JOIN)
+            # Инициализируем конфигурацию по умолчанию
             # Очищаем старую конфигурацию при новом построении графа
             st.session_state.table_config = {}
-            for rel in relationships:
+            
+            # Этап 3.6: Проверка уникальных значений для фильтрации связей
+            status_text.text("Этап 3.6/6: Проверка уникальных значений в полях...")
+            progress_bar.progress(75)
+            
+            disabled_count = 0
+            total_relationships = len(relationships)
+            
+            # Проверяем каждую связь на количество уникальных значений
+            for idx, rel in enumerate(relationships):
+                # Обновляем progress bar
+                progress_value = 75 + int((idx + 1) / total_relationships * 5)  # 75-80%
+                progress_bar.progress(progress_value)
+                
+                # Проверяем количество уникальных значений в поле связи
+                try:
+                    distinct_count = analyzer.get_distinct_count(
+                        rel['source_table'],
+                        rel['field_name']
+                    )
+                    
+                    # Включаем связь только если количество уникальных значений >= 2
+                    enabled = distinct_count >= 2
+                    if not enabled:
+                        disabled_count += 1
+                except Exception as e:
+                    # В случае ошибки отключаем связь (консервативный подход)
+                    enabled = False
+                    disabled_count += 1
+                
+                # Инициализируем конфигурацию связи
                 st.session_state.table_config[rel['relationship_key']] = {
-                    'enabled': True,
+                    'enabled': enabled,
                     'join_type': 'LEFT JOIN'
                 }
             
             progress_bar.progress(80)
-            status_text.text(f"✅ Граф связей построен. Найдено {len(relationships)} связей. Перейдите к разделу 'Выбор присоединяемых таблиц' для настройки.")
+            
+            # Формируем сообщение о результатах
+            if disabled_count > 0:
+                status_text.text(
+                    f"✅ Граф связей построен. Найдено {len(relationships)} связей. "
+                    f"Отключено {disabled_count} связей с менее чем 2 уникальными значениями. "
+                    f"Перейдите к разделу 'Выбор присоединяемых таблиц' для настройки."
+                )
+            else:
+                status_text.text(
+                    f"✅ Граф связей построен. Найдено {len(relationships)} связей. "
+                    f"Перейдите к разделу 'Выбор присоединяемых таблиц' для настройки."
+                )
             
             # Перезагружаем страницу, чтобы показать секцию выбора таблиц
             # После st.rerun() страница перезагрузится и покажет секцию выбора таблиц
@@ -361,7 +403,21 @@ if st.session_state.get('graph_built') and st.session_state.get('fact_table_db')
             
             indent = "  " * indent_level
             
-            # Строка 1: Нумерация и источник → цель
+            # Получаем техническое название PK целевой таблицы
+            target_pk = "ID"  # По умолчанию
+            try:
+                if st.session_state.analyzer:
+                    pk_columns = st.session_state.analyzer.get_primary_keys(rel['target_table'])
+                    if pk_columns:
+                        target_pk = pk_columns[0]  # Берем первый PK
+            except:
+                pass  # Если не удалось получить PK, используем значение по умолчанию
+            
+            # Формируем технические названия для отображения
+            source_tech = f"{rel['source_table']}.{rel['field_name']}"
+            target_tech = f"{rel['target_table']}.{target_pk}"
+            
+            # Строка 1: Нумерация и источник → цель с техническими названиями
             col1, col2 = st.columns([1, 11])
             with col1:
                 if number_str:
@@ -370,9 +426,9 @@ if st.session_state.get('graph_built') and st.session_state.get('fact_table_db')
                     st.empty()
             with col2:
                 if indent_level > 0:
-                    st.markdown(f"{indent}└─ **{target_human}**")
+                    st.markdown(f"{indent}└─ **{target_human}** ({target_tech})")
                 else:
-                    st.markdown(f"**{source_human}** → **{target_human}**")
+                    st.markdown(f"**{source_human}** ({source_tech}) → **{target_human}** ({target_tech})")
             
             # Строка 2: Поле
             col1, col2 = st.columns([1, 11])
@@ -737,6 +793,20 @@ if st.session_state.get('graph_built') and st.session_state.get('relationships_c
             # Компактный дизайн: 3 строки
             indent = "  " * indent_level  # Отступ для вложенности
             
+            # Получаем техническое название PK целевой таблицы
+            target_pk = "ID"  # По умолчанию
+            try:
+                if st.session_state.analyzer:
+                    pk_columns = st.session_state.analyzer.get_primary_keys(rel['target_table'])
+                    if pk_columns:
+                        target_pk = pk_columns[0]  # Берем первый PK
+            except:
+                pass  # Если не удалось получить PK, используем значение по умолчанию
+            
+            # Формируем технические названия для отображения
+            source_tech = f"{rel['source_table']}.{rel['field_name']}"
+            target_tech = f"{rel['target_table']}.{target_pk}"
+            
             # Строка 1: Нумерация, чекбокс, источник → цель, тип JOIN
             col1, col2, col3, col4 = st.columns([1, 0.5, 5, 2])
             
@@ -776,11 +846,11 @@ if st.session_state.get('graph_built') and st.session_state.get('relationships_c
                 )
             
             with col3:
-                # Компактное отображение: источник → цель через поле
+                # Компактное отображение: источник → цель через поле с техническими названиями
                 if indent_level > 0:
-                    st.markdown(f"{indent}└─ **{target_human}**")
+                    st.markdown(f"{indent}└─ **{target_human}**({target_tech})")
                 else:
-                    st.markdown(f"**{source_human}** → **{target_human}**")
+                    st.markdown(f"**{source_human}**({source_tech}) → **{target_human}**({target_tech})")
             
             with col4:
                 # Выбор типа JOIN

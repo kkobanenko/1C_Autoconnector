@@ -45,6 +45,9 @@ DEFAULT_FIX_DATES = True
 # Порт для Streamlit UI
 STREAMLIT_PORT = 8512
 
+# Версия плагина
+VERSION = "1.0.1"
+
 
 
 
