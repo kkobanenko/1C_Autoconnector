@@ -7,6 +7,9 @@
 import os
 from pathlib import Path
 
+# Версия плагина
+VERSION = "1.0.0"
+
 # Базовый путь проекта
 BASE_DIR = Path(__file__).parent
 
@@ -44,9 +47,6 @@ DEFAULT_FIX_DATES = True
 
 # Порт для Streamlit UI
 STREAMLIT_PORT = 8512
-
-# Версия плагина
-VERSION = "1.0.1"
 
 
 
