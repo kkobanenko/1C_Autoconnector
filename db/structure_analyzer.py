@@ -4,7 +4,10 @@
 Получает метаданные таблиц, полей, первичных и внешних ключей.
 """
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
+import json
+import base64
+from pathlib import Path
 from utils.db_connection import create_connection
 
 
@@ -29,7 +32,8 @@ class StructureAnalyzer:
         self._primary_keys_cache: Dict[str, List[str]] = {}
         self._foreign_keys_cache: Dict[str, List[Dict]] = {}
         self._guid_to_table_cache: Optional[Dict[bytes, str]] = None  # Кэш GUID -> таблица
-        self._distinct_count_cache: Dict[str, int] = {}  # Кэш количества уникальных значений
+        self._relationship_index: Optional[Dict[str, Dict[str, str]]] = None  # Индекс связей: {table → {field → target_table}}
+        self._field_stats_cache: Optional[Dict[str, Dict[str, dict]]] = None  # Кэш статистики полей
     
     def connect(self):
         """Подключается к базе данных."""
@@ -227,6 +231,66 @@ class StructureAnalyzer:
         self._primary_keys_cache[normalized] = pk_columns
         return pk_columns
     
+    def has_at_least_two_distinct_values(self, table_name: str, field_name: str) -> bool:
+        """
+        Проверяет, есть ли в поле таблицы хотя бы два различных значения (ленивый способ).
+        Использует TOP 2 для оптимизации - не считает все уникальные значения.
+        
+        Args:
+            table_name: Имя таблицы
+            field_name: Имя поля
+            
+        Returns:
+            True если найдено >= 2 уникальных значений, False иначе (включая ошибки)
+        """
+        import sys
+        
+        try:
+            # Нормализуем имя таблицы
+            normalized = self._normalize_table_name(table_name)
+            
+            # Парсим схему и таблицу
+            schema, table = self._parse_table_name(normalized)
+            
+            # Логируем нормализованные имена для диагностики
+            print(f"[DEBUG] Проверка уникальных значений: исходная таблица='{table_name}' -> нормализованная='{normalized}' -> схема='{schema}', таблица='{table}', поле='{field_name}'", file=sys.stderr)
+            
+            # Подключаемся к БД если нужно
+            self.connect()
+            cursor = self.conn.cursor()
+            
+            # Выполняем оптимизированный запрос: получаем только первые 2 уникальных значения
+            # В SQL Server правильный синтаксис: SELECT DISTINCT TOP N, а не SELECT TOP N DISTINCT
+            query = f"""
+                SELECT DISTINCT TOP 2 [{field_name}]
+                FROM [{schema}].[{table}]
+                WHERE [{field_name}] IS NOT NULL
+            """
+            
+            # Логируем SQL запрос перед выполнением
+            print(f"[DEBUG] SQL запрос: {query.strip()}", file=sys.stderr)
+            
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            cursor.close()
+            
+            # Логируем количество найденных строк
+            row_count = len(rows)
+            print(f"[DEBUG] Найдено строк: {row_count}", file=sys.stderr)
+            
+            # Если получили 2 или более строк, значит есть хотя бы 2 уникальных значения
+            result = row_count >= 2
+            print(f"[DEBUG] Результат проверки: {result} (>= 2 уникальных значений)", file=sys.stderr)
+            
+            return result
+            
+        except Exception as e:
+            # Логируем ошибку для диагностики (можно убрать в продакшене)
+            error_msg = f"[ERROR] Ошибка при проверке уникальных значений для {table_name}.{field_name}: {type(e).__name__}: {str(e)}"
+            print(error_msg, file=sys.stderr)
+            # При любой ошибке возвращаем False (консервативный подход)
+            return False
+    
     def get_foreign_keys(self, table_name: str) -> List[Dict]:
         """
         Получает список внешних ключей таблицы.
@@ -344,6 +408,73 @@ class StructureAnalyzer:
         
         return datetime2_fields
     
+    def get_table_row_count(self, table_name: str) -> int:
+        """
+        Получает приблизительное количество строк в таблице.
+        Использует sys.dm_db_partition_stats для быстрого подсчёта без полного сканирования.
+        
+        Args:
+            table_name: Имя таблицы
+            
+        Returns:
+            Приблизительное количество строк
+        """
+        try:
+            self.connect()
+            cursor = self.conn.cursor()
+            normalized = self._normalize_table_name(table_name)
+            schema, table = self._parse_table_name(normalized)
+            
+            # Быстрый приблизительный подсчёт через системные DMV
+            cursor.execute("""
+                SELECT SUM(p.rows)
+                FROM sys.partitions p
+                INNER JOIN sys.tables t ON p.object_id = t.object_id
+                INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = ? AND t.name = ?
+                AND p.index_id IN (0, 1)
+            """, (schema, table))
+            
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if result and result[0] is not None:
+                return int(result[0])
+            return 0
+        except Exception:
+            return 0
+    
+    def get_vt_tables(self, table_name: str) -> List[str]:
+        """
+        Находит табличные части (VT-таблицы) для данной таблицы.
+        В 1С табличные части именуются по шаблону: _TableName_VTnumber
+        Например: _Document653 → _Document653_VT12345
+        
+        Args:
+            table_name: Имя таблицы (например, _Document653)
+            
+        Returns:
+            Список имён VT-таблиц
+        """
+        normalized = self._normalize_table_name(table_name)
+        # Убираем квадратные скобки
+        clean_name = normalized.strip('[]')
+        
+        all_tables = self.get_all_tables()
+        vt_tables = []
+        
+        # Ищем таблицы, начинающиеся с "tableName_VT"
+        prefix = f"{clean_name}_VT"
+        for t in all_tables:
+            t_clean = t.strip('[]')
+            # Пропускаем полные имена со схемой
+            if '.' in t_clean:
+                continue
+            if t_clean.startswith(prefix):
+                vt_tables.append(t_clean)
+        
+        return sorted(vt_tables)
+    
     def _normalize_table_name(self, table_name: str) -> str:
         """
         Нормализует имя таблицы (добавляет подчеркивание если нужно).
@@ -414,22 +545,30 @@ class StructureAnalyzer:
         # По умолчанию схема dbo, сохраняем подчеркивание в имени таблицы
         return 'dbo', table_name
     
-    def build_guid_index(self, limit_per_table: int = 100) -> Dict[bytes, str]:
+    def build_guid_index(self, limit_per_table: int = 100, force_rebuild: bool = False, progress_callback=None) -> Dict[bytes, str]:
         """
         Строит индекс GUID -> таблица для быстрого поиска целевых таблиц.
-        Для каждой таблицы проверяет поля, которые:
-        - Имеют тип binary(16) или varbinary(16)
-        - Равны или заканчиваются на "_IDRRef" или "IDRRef"
-        Берет первые N ненулевых значений из этих полей.
+        Если индекс уже есть в памяти или на диске — использует его.
         
         Args:
             limit_per_table: Максимальное количество GUID для выборки из каждого поля
+            force_rebuild: Если True — перестраивает индекс заново, игнорируя кэш и файл
+            progress_callback: Функция обратного вызова progress_callback(current, total, table_name)
             
         Returns:
             Словарь {guid_bytes: table_name}
         """
-        if self._guid_to_table_cache is not None:
+        # 1. Если не force_rebuild и есть в памяти — возвращаем
+        if not force_rebuild and self._guid_to_table_cache is not None:
             return self._guid_to_table_cache
+        
+        # 2. Если не force_rebuild — пробуем загрузить с диска
+        if not force_rebuild:
+            loaded = self.load_guid_index()
+            if loaded is not None:
+                self._guid_to_table_cache = loaded
+                print(f"GUID-индекс загружен с диска: {len(loaded)} записей")
+                return loaded
         
         self.connect()
         cursor = self.conn.cursor()
@@ -481,7 +620,9 @@ class StructureAnalyzer:
         # Это гарантирует, что при конфликте GUID приоритет будет у основной таблицы
         tables_ordered = main_tables + tabular_parts
         
-        for table_name in tables_ordered:
+        for idx_i, table_name in enumerate(tables_ordered):
+            if progress_callback:
+                progress_callback(idx_i, len(tables_ordered), table_name)
             try:
                 normalized = self._normalize_table_name(table_name)
                 schema, table = self._parse_table_name(normalized)
@@ -575,6 +716,10 @@ class StructureAnalyzer:
         cursor.close()
         self._guid_to_table_cache = guid_index
         print(f"Индекс построен: {len(guid_index)} GUID -> таблицы")
+        
+        # Автоматически сохраняем на диск
+        self.save_guid_index(guid_index)
+        
         return guid_index
     
     def find_table_by_guid(self, guid_value: bytes, guid_index: Optional[Dict[bytes, str]] = None) -> Optional[str]:
@@ -595,44 +740,584 @@ class StructureAnalyzer:
     
     def clear_guid_index_cache(self):
         """
-        Очищает кэш индекса GUID -> таблица.
-        Полезно для перестроения индекса с новой логикой.
+        Очищает кэш индекса GUID -> таблица (только в памяти).
         """
         self._guid_to_table_cache = None
-    
-    def get_distinct_count(self, table_name: str, field_name: str) -> int:
-        """
-        Получает количество уникальных значений в поле таблицы.
+
+    def _parse_connection_params(self) -> Tuple[str, str]:
+        """Извлекает host и database из строки подключения."""
+        host = 'unknown'
+        database = 'unknown'
+        if self.connection_string:
+            for part in self.connection_string.split(';'):
+                part = part.strip()
+                if '=' in part:
+                    key, val = part.split('=', 1)
+                    key_lower = key.strip().lower()
+                    if key_lower == 'server':
+                        host = val.strip()
+                    elif key_lower == 'database':
+                        database = val.strip()
+        return host, database
+
+    def _get_guid_index_path(self) -> Path:
+        """Возвращает путь к файлу GUID-индекса для текущего подключения."""
+        import hashlib
+        from config import DEFAULT_OUTPUT_DIR
+        output_dir = Path(DEFAULT_OUTPUT_DIR)
+        output_dir.mkdir(parents=True, exist_ok=True)
         
-        Args:
-            table_name: Имя таблицы
-            field_name: Имя поля
-            
-        Returns:
-            Количество уникальных значений (0 в случае ошибки)
+        host, database = self._parse_connection_params()
+        # Создаём уникальное имя файла из host+database
+        key = f"{host}_{database}"
+        # Санитизируем для имени файла
+        safe_key = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in key)
+        # Если слишком длинное — добавляем хэш
+        if len(safe_key) > 60:
+            h = hashlib.md5(key.encode()).hexdigest()[:8]
+            safe_key = safe_key[:50] + '_' + h
+        return output_dir / f"guid_index_{safe_key}.json"
+
+    def save_guid_index(self, guid_index: Optional[Dict[bytes, str]] = None) -> bool:
         """
-        # Кэширование результатов
-        cache_key = f"{table_name}|{field_name}"
-        if cache_key in self._distinct_count_cache:
-            return self._distinct_count_cache[cache_key]
+        Сохраняет GUID-индекс на диск с метаданными подключения.
+        
+        Returns:
+            True если сохранение успешно
+        """
+        if guid_index is None:
+            guid_index = self._guid_to_table_cache
+        if guid_index is None:
+            return False
         
         try:
-            self.connect()
-            schema, table = self._parse_table_name(table_name)
-            cursor = self.conn.cursor()
+            from datetime import datetime
             
-            # Экранируем имена для безопасности
-            query = f"SELECT COUNT(DISTINCT [{field_name}]) FROM [{schema}].[{table}]"
-            cursor.execute(query)
-            result = cursor.fetchone()[0]
-            cursor.close()
+            serializable = {}
+            for guid_bytes, table_name in guid_index.items():
+                key = base64.b64encode(guid_bytes).decode('ascii')
+                serializable[key] = table_name
             
-            count = result if result is not None else 0
-            self._distinct_count_cache[cache_key] = count
-            return count
+            host, database = self._parse_connection_params()
+            
+            path = self._get_guid_index_path()
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'version': 2,
+                    'metadata': {
+                        'host': host,
+                        'database': database,
+                        'built_at': datetime.now().isoformat(),
+                        'count': len(serializable)
+                    },
+                    'index': serializable
+                }, f, ensure_ascii=False)
+            
+            print(f"GUID-индекс сохранён: {path} ({len(serializable)} записей)")
+            return True
         except Exception as e:
-            # В случае ошибки возвращаем 0 (консервативный подход)
-            # Не логируем ошибку, чтобы не засорять вывод
-            self._distinct_count_cache[cache_key] = 0
-            return 0
+            print(f"Ошибка сохранения GUID-индекса: {e}")
+            return False
 
+    def load_guid_index(
+        self,
+        progress_callback: Optional[Callable[[float, str], None]] = None
+    ) -> Optional[Dict[bytes, str]]:
+        """
+        Загружает GUID-индекс с диска.
+        Проверяет соответствие сохранённого индекса текущему подключению.
+
+        Args:
+            progress_callback: Опциональный callback(progress: float, text: str) для отображения прогресса.
+                              progress от 0.0 до 1.0, text — текст статуса.
+
+        Returns:
+            Словарь {guid_bytes: table_name} или None если файл не найден / не соответствует
+        """
+        def _report(prog: float, txt: str):
+            if progress_callback:
+                progress_callback(prog, txt)
+
+        try:
+            path = self._get_guid_index_path()
+            if not path.exists():
+                return None
+
+            _report(0.05, "Чтение файла...")
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            _report(0.15, "Проверка подключения...")
+            metadata = data.get('metadata', {})
+            saved_host = metadata.get('host', '')
+            saved_db = metadata.get('database', '')
+            current_host, current_db = self._parse_connection_params()
+
+            if saved_host != current_host or saved_db != current_db:
+                print(f"GUID-индекс не соответствует: сохранён для {saved_host}/{saved_db}, "
+                      f"текущее подключение {current_host}/{current_db}")
+                return None
+
+            serializable = data.get('index', {})
+            total = len(serializable)
+            guid_index: Dict[bytes, str] = {}
+            batch_size = max(5000, total // 50)  # Обновлять прогресс каждые ~2%
+            processed = 0
+
+            for b64_key, table_name in serializable.items():
+                guid_bytes = base64.b64decode(b64_key)
+                guid_index[guid_bytes] = table_name
+                processed += 1
+                if processed % batch_size == 0 and total > 0:
+                    pct = 0.15 + 0.85 * (processed / total)
+                    _report(pct, f"Декодирование: {processed:,} / {total:,}")
+
+            _report(1.0, "Готово")
+            return guid_index
+        except Exception as e:
+            print(f"Ошибка загрузки GUID-индекса: {e}")
+            return None
+
+    def get_guid_index_metadata(self) -> Optional[Dict]:
+        """
+        Возвращает метаданные сохранённого GUID-индекса (без загрузки самого индекса).
+        
+        Returns:
+            {'host': str, 'database': str, 'built_at': str, 'count': int} или None
+        """
+        try:
+            path = self._get_guid_index_path()
+            if not path.exists():
+                return None
+            
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            return data.get('metadata')
+        except Exception:
+            return None
+
+    def delete_guid_index_file(self) -> bool:
+        """Удаляет файл GUID-индекса с диска."""
+        try:
+            path = self._get_guid_index_path()
+            if path.exists():
+                path.unlink()
+                return True
+            return False
+        except Exception:
+            return False
+
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Индекс связей (relationship index): {table → {field → target_table}}
+    # ═══════════════════════════════════════════════════════════════════
+
+    def build_relationship_index(
+        self,
+        guid_index: Optional[Dict[bytes, str]] = None,
+        force_rebuild: bool = False,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None
+    ) -> Dict[str, Dict[str, str]]:
+        """
+        Строит индекс связей для ВСЕХ таблиц 1С.
+        Для каждой таблицы и каждого поля binary(16) определяет целевую таблицу
+        через GUID-индекс (без тяжёлых SQL-запросов на каждое поле каждой таблицы).
+
+        Args:
+            guid_index: Основной GUID-индекс {guid_bytes → table_name}. Если None — берёт из кэша.
+            force_rebuild: Пересобрать, даже если кэш есть
+            progress_callback: callback(current, total, table_name)
+
+        Returns:
+            {table_name: {field_name: target_table_name}}
+        """
+        if not force_rebuild and self._relationship_index is not None:
+            return self._relationship_index
+
+        if not force_rebuild:
+            loaded = self._load_relationship_index()
+            if loaded is not None:
+                self._relationship_index = loaded
+                return loaded
+
+        if guid_index is None:
+            guid_index = self._guid_to_table_cache
+        if not guid_index:
+            return {}
+
+        self.connect()
+        cursor = self.conn.cursor()
+
+        all_tables = self.get_all_tables()
+        tables_1c = []
+        for t in all_tables:
+            if t.startswith('[') and '.' in t:
+                continue
+            table_simple = t.strip('[]')
+            if '.' in table_simple:
+                table_simple = table_simple.split('.')[-1]
+            if (table_simple.startswith('_') or
+                table_simple.startswith('Document') or
+                table_simple.startswith('Reference') or
+                table_simple.startswith('Enum')):
+                tables_1c.append(table_simple)
+
+        rel_index: Dict[str, Dict[str, str]] = {}
+        total = len(tables_1c)
+
+        for idx, table_name in enumerate(tables_1c):
+            if progress_callback:
+                progress_callback(idx, total, table_name)
+            try:
+                normalized = self._normalize_table_name(table_name)
+                binary16_fields = self.get_binary16_fields(normalized)
+                if not binary16_fields:
+                    continue
+
+                schema, table = self._parse_table_name(normalized)
+                table_rels: Dict[str, str] = {}
+
+                for field_name in binary16_fields:
+                    # Пропускаем PK-поля (_IDRRef и т.п.)
+                    field_clean = field_name.lstrip('_')
+                    if field_clean in ('IDRRef', 'ID', 'Version', 'Marked'):
+                        continue
+                    try:
+                        query = (
+                            f"SELECT TOP 1 [{field_name}] "
+                            f"FROM [{schema}].[{table}] "
+                            f"WHERE [{field_name}] IS NOT NULL "
+                            f"AND [{field_name}] != 0x00000000000000000000000000000000"
+                        )
+                        cursor.execute(query)
+                        row = cursor.fetchone()
+                        if row and row[0]:
+                            guid_value = row[0]
+                            if isinstance(guid_value, bytearray):
+                                guid_bytes = bytes(guid_value)
+                            elif isinstance(guid_value, bytes):
+                                guid_bytes = guid_value
+                            else:
+                                guid_bytes = bytes(guid_value)
+                            if len(guid_bytes) == 16:
+                                target = guid_index.get(guid_bytes)
+                                if target:
+                                    table_rels[field_name] = target
+                    except Exception:
+                        continue
+
+                if table_rels:
+                    rel_index[normalized] = table_rels
+            except Exception:
+                continue
+
+        cursor.close()
+        self._relationship_index = rel_index
+        self._save_relationship_index(rel_index)
+        return rel_index
+
+    def _get_relationship_index_path(self) -> Path:
+        """Путь к файлу индекса связей на диске."""
+        host, database = self._parse_connection_params()
+        safe_key = f"{host}_{database}".replace('\\', '_').replace('/', '_').replace(':', '_')
+        output_dir = Path('output')
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return output_dir / f"relationship_index_{safe_key}.json"
+
+    def _save_relationship_index(self, rel_index: Dict[str, Dict[str, str]]) -> bool:
+        """Сохраняет индекс связей на диск."""
+        try:
+            from datetime import datetime
+            host, database = self._parse_connection_params()
+            path = self._get_relationship_index_path()
+            total_fields = sum(len(v) for v in rel_index.values())
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'version': 1,
+                    'metadata': {
+                        'host': host,
+                        'database': database,
+                        'built_at': datetime.now().isoformat(),
+                        'tables': len(rel_index),
+                        'fields': total_fields,
+                    },
+                    'index': rel_index
+                }, f, ensure_ascii=False)
+            return True
+        except Exception:
+            return False
+
+    def _load_relationship_index(self) -> Optional[Dict[str, Dict[str, str]]]:
+        """Загружает индекс связей с диска. Проверяет соответствие подключению."""
+        try:
+            path = self._get_relationship_index_path()
+            if not path.exists():
+                return None
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            metadata = data.get('metadata', {})
+            current_host, current_db = self._parse_connection_params()
+            if metadata.get('host') != current_host or metadata.get('database') != current_db:
+                return None
+            return data.get('index', {})
+        except Exception:
+            return None
+
+    def get_relationship_index_metadata(self) -> Optional[Dict]:
+        """Метаданные сохранённого индекса связей (без загрузки)."""
+        try:
+            path = self._get_relationship_index_path()
+            if not path.exists():
+                return None
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data.get('metadata')
+        except Exception:
+            return None
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Field Stats (анализ кардинальности полей)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def build_field_stats(
+        self,
+        sample_size: int = 2000,
+        junk_threshold: int = 1,
+        force_rebuild: bool = False,
+        progress_callback=None
+    ) -> Dict[str, Dict[str, dict]]:
+        """
+        Строит статистику кардинальности полей для всех таблиц 1С.
+        
+        Для каждого поля каждой таблицы вычисляет COUNT(DISTINCT)
+        по выборке TOP(sample_size) строк.
+        Поля с distinct_count <= junk_threshold помечаются как мусорные.
+        
+        Args:
+            sample_size: Размер выборки (TOP N) для подсчёта уникальных значений
+            junk_threshold: Порог мусорности (<=)
+            force_rebuild: Пересобрать, даже если кэш есть
+            progress_callback: Функция обратного вызова progress_callback(current, total, table_name)
+            
+        Returns:
+            {table_name: {field_name: {distinct_count, is_junk, data_type, max_length}}}
+        """
+        if not force_rebuild and self._field_stats_cache is not None:
+            return self._field_stats_cache
+
+        if not force_rebuild:
+            loaded = self.load_field_stats()
+            if loaded is not None:
+                self._field_stats_cache = loaded
+                print(f"Статистика полей загружена с диска: {sum(len(v) for v in loaded.values())} полей в {len(loaded)} таблицах")
+                return loaded
+
+        self.connect()
+        cursor = self.conn.cursor()
+
+        all_tables = self.get_all_tables()
+
+        # Фильтруем только таблицы 1С
+        tables_1c = []
+        for t in all_tables:
+            if t.startswith('[') and '.' in t:
+                continue
+            table_simple = t.strip('[]')
+            if '.' in table_simple:
+                table_simple = table_simple.split('.')[-1]
+            if (table_simple.startswith('_') or
+                table_simple.startswith('Document') or
+                table_simple.startswith('Reference') or
+                table_simple.startswith('Enum')):
+                tables_1c.append(table_simple)
+
+        field_stats: Dict[str, Dict[str, dict]] = {}
+        total = len(tables_1c)
+        print(f"Анализ кардинальности полей для {total} таблиц (sample={sample_size})...")
+
+        for idx, table_name in enumerate(tables_1c):
+            if progress_callback:
+                progress_callback(idx, total, table_name)
+
+            try:
+                normalized = self._normalize_table_name(table_name)
+                schema, table = self._parse_table_name(normalized)
+                columns = self.get_table_columns(normalized)
+
+                if not columns:
+                    continue
+
+                table_stats: Dict[str, dict] = {}
+
+                for col in columns:
+                    col_name = col['name']
+                    col_type = col.get('data_type', 'unknown')
+                    col_max_length = col.get('max_length')
+
+                    try:
+                        query = f"""
+                            SELECT COUNT(DISTINCT [{col_name}]) AS dc
+                            FROM (SELECT TOP ({sample_size}) [{col_name}]
+                                  FROM [{schema}].[{table}]) AS _sample
+                        """
+                        cursor.execute(query)
+                        row = cursor.fetchone()
+                        dc = row[0] if row else 0
+
+                        table_stats[col_name] = {
+                            'distinct_count': dc,
+                            'is_junk': dc <= junk_threshold,
+                            'data_type': col_type,
+                            'max_length': col_max_length
+                        }
+                    except Exception:
+                        table_stats[col_name] = {
+                            'distinct_count': -1,
+                            'is_junk': False,
+                            'data_type': col_type,
+                            'max_length': col_max_length
+                        }
+
+                if table_stats:
+                    field_stats[normalized] = table_stats
+
+            except Exception:
+                continue
+
+        cursor.close()
+        self._field_stats_cache = field_stats
+
+        total_fields = sum(len(v) for v in field_stats.values())
+        junk_fields = sum(1 for t in field_stats.values() for f in t.values() if f.get('is_junk'))
+        print(f"Статистика полей построена: {total_fields} полей в {len(field_stats)} таблицах, мусорных: {junk_fields}")
+
+        self.save_field_stats(field_stats, sample_size=sample_size, junk_threshold=junk_threshold)
+        return field_stats
+
+    def _get_field_stats_path(self) -> Path:
+        """Возвращает путь к файлу статистики полей."""
+        import hashlib
+        from config import DEFAULT_OUTPUT_DIR
+        output_dir = Path(DEFAULT_OUTPUT_DIR)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        host, database = self._parse_connection_params()
+        key = f"{host}_{database}"
+        safe_key = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in key)
+        if len(safe_key) > 60:
+            h = hashlib.md5(key.encode()).hexdigest()[:8]
+            safe_key = safe_key[:50] + '_' + h
+        return output_dir / f"field_stats_{safe_key}.json"
+
+    def save_field_stats(
+        self,
+        field_stats: Optional[Dict[str, Dict[str, dict]]] = None,
+        sample_size: int = 2000,
+        junk_threshold: int = 1
+    ) -> bool:
+        """Сохраняет статистику полей на диск."""
+        if field_stats is None:
+            field_stats = self._field_stats_cache
+        if field_stats is None:
+            return False
+
+        try:
+            from datetime import datetime
+            host, database = self._parse_connection_params()
+
+            total_fields = sum(len(v) for v in field_stats.values())
+            junk_fields = sum(1 for t in field_stats.values() for f in t.values() if f.get('is_junk'))
+
+            path = self._get_field_stats_path()
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'version': 1,
+                    'metadata': {
+                        'host': host,
+                        'database': database,
+                        'built_at': datetime.now().isoformat(),
+                        'table_count': len(field_stats),
+                        'total_fields': total_fields,
+                        'junk_fields': junk_fields,
+                        'sample_size': sample_size,
+                        'junk_threshold': junk_threshold
+                    },
+                    'stats': field_stats
+                }, f, ensure_ascii=False)
+
+            print(f"Статистика полей сохранена: {path}")
+            return True
+        except Exception as e:
+            print(f"Ошибка сохранения статистики полей: {e}")
+            return False
+
+    def load_field_stats(
+        self,
+        progress_callback: Optional[Callable[[float, str], None]] = None
+    ) -> Optional[Dict[str, Dict[str, dict]]]:
+        """Загружает статистику полей с диска."""
+        def _report(prog: float, txt: str):
+            if progress_callback:
+                progress_callback(prog, txt)
+
+        try:
+            path = self._get_field_stats_path()
+            if not path.exists():
+                return None
+
+            _report(0.1, "Чтение файла статистики...")
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            _report(0.8, "Проверка подключения...")
+            metadata = data.get('metadata', {})
+            saved_host = metadata.get('host', '')
+            saved_db = metadata.get('database', '')
+            current_host, current_db = self._parse_connection_params()
+
+            if saved_host != current_host or saved_db != current_db:
+                print(f"Статистика полей не соответствует текущему подключению")
+                return None
+
+            _report(1.0, "Готово")
+            return data.get('stats', {})
+        except Exception as e:
+            print(f"Ошибка загрузки статистики полей: {e}")
+            return None
+
+    def get_field_stats_metadata(self) -> Optional[Dict]:
+        """Возвращает метаданные сохранённой статистики полей."""
+        try:
+            path = self._get_field_stats_path()
+            if not path.exists():
+                return None
+
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            return data.get('metadata')
+        except Exception:
+            return None
+
+    def clear_field_stats_cache(self):
+        """Очищает кэш статистики полей (только в памяти)."""
+        self._field_stats_cache = None
+
+    def is_junk_field(self, table_name: str, field_name: str) -> bool:
+        """Проверяет, является ли поле мусорным."""
+        if self._field_stats_cache is None:
+            return False
+        normalized = self._normalize_table_name(table_name)
+        table_stats = self._field_stats_cache.get(normalized, {})
+        field_info = table_stats.get(field_name, {})
+        return field_info.get('is_junk', False)
+
+    def get_field_distinct_count(self, table_name: str, field_name: str) -> int:
+        """Возвращает количество уникальных значений поля (-1 если нет данных)."""
+        if self._field_stats_cache is None:
+            return -1
+        normalized = self._normalize_table_name(table_name)
+        table_stats = self._field_stats_cache.get(normalized, {})
+        field_info = table_stats.get(field_name, {})
+        return field_info.get('distinct_count', -1)

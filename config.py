@@ -13,6 +13,16 @@ VERSION = "1.0.0"
 # Базовый путь проекта
 BASE_DIR = Path(__file__).parent
 
+# Загружаем .env файл если он существует
+_env_file = BASE_DIR / ".env"
+if _env_file.exists():
+    with open(_env_file, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                os.environ.setdefault(key.strip(), value.strip())
+
 # Параметры подключения к базе данных
 MSSQL_HOST = os.getenv("MSSQL_HOST", "localhost")
 MSSQL_DATABASE = os.getenv("MSSQL_DATABASE", "database_name")
@@ -34,7 +44,6 @@ def get_connection_string() -> str:
         f"PWD={MSSQL_PASSWORD};"
         f"Encrypt=yes;"
         f"TrustServerCertificate=yes;"
-        f"Connection Timeout=10;"
     )
 
 # Пути к файлам по умолчанию

@@ -13,7 +13,6 @@ CONNECTION_STRING = (
     "PWD=password;"
     "Encrypt=yes;"
     "TrustServerCertificate=yes;"
-    "Connection Timeout=10;"
 )
 
 conn = connect(CONNECTION_STRING)

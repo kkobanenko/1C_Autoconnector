@@ -22,7 +22,6 @@ CONNECTION_STRING = (
     f"PWD={MSSQL_PASSWORD};"
     f"Encrypt=yes;"
     f"TrustServerCertificate=yes;"
-    f"Connection Timeout=10;"
 )
 
 

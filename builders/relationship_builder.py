@@ -37,10 +37,13 @@ class RelationshipBuilder:
         self.relationship_graph = {}
         
         # Строим индекс GUID -> таблица заранее для ускорения поиска
-        # Очищаем кэш в analyzer, чтобы гарантировать использование новой логики
-        print("Построение индекса GUID для определения связей...")
-        self.analyzer.clear_guid_index_cache()
-        self._guid_index = self.analyzer.build_guid_index(limit_per_table=100)
+        # Используем кэш: если индекс уже загружен (в память или с диска), не пересоздаём
+        if self.analyzer._guid_to_table_cache is not None:
+            self._guid_index = self.analyzer._guid_to_table_cache
+            print(f"GUID-индекс уже закэширован: {len(self._guid_index)} записей")
+        else:
+            print("Построение индекса GUID для определения связей...")
+            self._guid_index = self.analyzer.build_guid_index(limit_per_table=100)
         
         # Если таблицы не указаны, получаем все таблицы из БД
         if table_names is None:
@@ -79,18 +82,10 @@ class RelationshipBuilder:
             for field_name in binary16_fields:
                 target_table = self._find_target_table(normalized, field_name)
                 if target_table:
-                    # В 1С поля binary(16) имеют суффикс RRef (например, _Fld10028RRef)
-                    # Сохраняем в графе БЕЗ суффикса для удобства поиска
-                    # Но также сохраняем и с суффиксом на случай если поиск идет по полному имени
-                    field_key = field_name
-                    if field_name.endswith('RRef'):
-                        # Сохраняем без суффикса как основной ключ
-                        field_key_no_rref = field_name[:-5]  # Убираем 'RRef'
-                        self.relationship_graph[normalized][field_key_no_rref] = target_table
-                        # Также сохраняем с подчеркиванием если его нет
-                        if not field_key_no_rref.startswith('_'):
-                            self.relationship_graph[normalized]['_' + field_key_no_rref] = target_table
-                    # Сохраняем и с полным именем на всякий случай
+                    # Сохраняем только реальные имена полей (из binary16_fields).
+                    # Не добавляем field_key_no_rref: итерация по графу использует ключи как имена полей,
+                    # и добавление варианта без RRef (напр. _Document653_I из _Document653_IDRRef) создаёт
+                    # связи по несуществующим полям.
                     self.relationship_graph[normalized][field_name] = target_table
         
         return self.relationship_graph
@@ -264,29 +259,21 @@ class RelationshipBuilder:
         binary16_fields = self.analyzer.get_binary16_fields(normalized)
         
         if not binary16_fields:
+            # Кэшируем пустой результат, чтобы не запрашивать повторно
+            self.relationship_graph[normalized] = relationships
             return relationships
         
         # Для каждого binary(16) поля пытаемся найти целевую таблицу
         for field_name in binary16_fields:
             target_table = self._find_target_table(normalized, field_name)
             if target_table:
-                # В 1С поля binary(16) имеют суффикс RRef (например, _Fld10028RRef)
-                # Сохраняем в графе БЕЗ суффикса для удобства поиска
-                # Но также сохраняем и с суффиксом на случай если поиск идет по полному имени
-                field_key = field_name
-                if field_name.endswith('RRef'):
-                    # Сохраняем без суффикса как основной ключ
-                    field_key_no_rref = field_name[:-5]  # Убираем 'RRef'
-                    relationships[field_key_no_rref] = target_table
-                    # Также сохраняем с подчеркиванием если его нет
-                    if not field_key_no_rref.startswith('_'):
-                        relationships['_' + field_key_no_rref] = target_table
-                # Сохраняем и с полным именем на всякий случай
+                # Сохраняем только реальные имена полей (из binary16_fields).
+                # Не добавляем field_key_no_rref: build_mixed_graph итерирует по ключам как по именам полей,
+                # добавление варианта без RRef создаёт связи по несуществующим полям (напр. _Document653_I).
                 relationships[field_name] = target_table
         
-        # Сохраняем в граф для будущего использования
-        if relationships:
-            self.relationship_graph[normalized] = relationships
+        # ВСЕГДА кэшируем результат (даже пустой) для предотвращения повторных SQL-запросов
+        self.relationship_graph[normalized] = relationships
         
         return relationships
     
@@ -346,6 +333,53 @@ class RelationshipBuilder:
         return self.relationship_graph
     
     def find_reverse_relationships(self, base_table: str, limit_guids: int = 100) -> List[Dict]:
+        """
+        Находит таблицы, ссылающиеся на base_table.
+
+        Источники (в порядке приоритета, объединяются):
+        1. Индекс связей (analyzer._relationship_index) — полный набор всех таблиц.
+        2. Кэш прямых связей (self.relationship_graph) — fallback для таблиц, обработанных BFS.
+        """
+        normalized_base = self._normalize_table_name(base_table)
+        reverse_relationships = []
+        found_keys: Set[str] = set()
+
+        def _add(table_name: str, field_name: str):
+            rk = f"{table_name}|{field_name}|{normalized_base}|reverse"
+            if rk in found_keys:
+                return
+            found_keys.add(rk)
+            reverse_relationships.append({
+                'source_table': table_name,
+                'source_alias': '',
+                'field_name': field_name,
+                'target_table': normalized_base,
+                'target_alias': '',
+                'relationship_key': rk,
+                'direction': 'reverse'
+            })
+
+        # 1. Индекс связей (полный, построен на шаге 2)
+        rel_idx = self.analyzer._relationship_index
+        if rel_idx:
+            for table_name, rels in rel_idx.items():
+                if table_name == normalized_base:
+                    continue
+                for field_name, target_table in rels.items():
+                    if self._normalize_table_name(target_table) == normalized_base:
+                        _add(table_name, field_name)
+
+        # 2. Кэш прямых связей (fallback — таблицы, обработанные BFS)
+        for table_name, rels in self.relationship_graph.items():
+            if table_name == normalized_base:
+                continue
+            for field_name, target_table in rels.items():
+                if self._normalize_table_name(target_table) == normalized_base:
+                    _add(table_name, field_name)
+
+        return reverse_relationships
+    
+    def find_reverse_relationships_LEGACY(self, base_table: str, limit_guids: int = 100) -> List[Dict]:
         """
         Находит все таблицы, которые ссылаются на базовую таблицу через поля binary(16).
         
@@ -542,6 +576,307 @@ class RelationshipBuilder:
             # В случае ошибки возвращаем пустой список
             return []
     
+    def build_mixed_graph(
+        self,
+        base_table: str,
+        max_depth_down: int = 3,
+        max_depth_up: int = 1,
+        structure_parser=None,
+        limit_guids: int = 100
+    ) -> List[Dict]:
+        """
+        Строит граф связей со смешанным обходом (вниз и вверх) от корневой таблицы.
+
+        На каждом шаге из текущей таблицы ищутся связи в обоих направлениях:
+          ↓ вниз — по binary(16) полям текущей таблицы
+          ↑ вверх — поиск таблиц, ссылающихся на текущую
+
+        Ограничения считаются по каждой ветке (пути от корня):
+          steps_down ≤ max_depth_down
+          steps_up   ≤ max_depth_up
+
+        Таблицы НЕ дедуплицируются — одна таблица может встречаться многократно
+        (по разным полям/путям). Самоссылки допускаются.
+        Зацикливание невозможно: конечный бюджет шагов гарантирует завершение.
+
+        Args:
+            base_table: Корневая таблица
+            max_depth_down: Макс. суммарных шагов вниз по ветке
+            max_depth_up: Макс. суммарных шагов вверх по ветке
+            structure_parser: Парсер структуры (для алиасов)
+            limit_guids: Лимит GUID при поиске обратных связей
+
+        Returns:
+            Список dict-ов с полями:
+                source_table, source_alias, field_name,
+                target_table, target_alias,
+                direction ('forward'|'reverse'),
+                steps_down, steps_up, depth,
+                relationship_key
+        """
+        import time as _time
+        import logging
+        _log = logging.getLogger('build_mixed_graph')
+        _log.setLevel(logging.DEBUG)
+        if not _log.handlers:
+            _h = logging.StreamHandler()
+            _h.setFormatter(logging.Formatter('[%(name)s] %(message)s'))
+            _log.addHandler(_h)
+
+        _t0 = _time.time()
+        _log.info("══ START build_mixed_graph ══  base=%s  down=%s  up=%s", base_table, max_depth_down, max_depth_up)
+
+        normalized_base = self._normalize_table_name(base_table)
+        _log.info("  normalized_base = %s", normalized_base)
+
+        # Строим GUID-индекс если ещё не построен — нужен для определения связей
+        _t1 = _time.time()
+        if self._guid_index is None:
+            if self.analyzer._guid_to_table_cache is not None:
+                self._guid_index = self.analyzer._guid_to_table_cache
+                _log.info("  GUID index from cache: %d entries  (%.1fs)", len(self._guid_index), _time.time() - _t1)
+            else:
+                _log.info("  Building GUID index from scratch...")
+                self._guid_index = self.analyzer.build_guid_index(limit_per_table=100)
+                _log.info("  GUID index built: %d entries  (%.1fs)", len(self._guid_index), _time.time() - _t1)
+        else:
+            _log.info("  GUID index already loaded: %d entries", len(self._guid_index))
+
+        # Убедимся что граф связей построен для корневой таблицы
+        _t2 = _time.time()
+        root_rels = self.get_related_tables(normalized_base)
+        _log.info("  Root table forward rels: %d fields  (%.1fs)", len(root_rels), _time.time() - _t2)
+
+        results: List[Dict] = []
+        alias_counter: Dict[str, int] = {}
+        visited_keys: Set[str] = set()
+
+        reverse_cache: Dict[str, List[Dict]] = {}
+
+        def _get_alias(table_name: str, source_table: str = None, field_name: str = None) -> str:
+            base_alias = self._generate_table_alias(table_name, structure_parser, source_table, field_name)
+            if table_name in alias_counter:
+                alias_counter[table_name] += 1
+                return f"{base_alias}_{alias_counter[table_name]}"
+            else:
+                alias_counter[table_name] = 1
+                return base_alias
+
+        def _find_reverse_for_table(table_name: str) -> List[Dict]:
+            if table_name in reverse_cache:
+                return reverse_cache[table_name]
+            _tr = _time.time()
+            rev = self.find_reverse_relationships(table_name, limit_guids=limit_guids)
+            reverse_cache[table_name] = rev
+            _log.info("      ↑ reverse for %s: %d rels  (%.1fs)", table_name, len(rev), _time.time() - _tr)
+            return rev
+
+        from collections import deque
+        queue = deque()
+        queue.append((normalized_base, 0, 0))
+
+        _bfs_iter = 0
+        _log.info("  BFS START  queue=1")
+
+        while queue:
+            current_table, sd, su = queue.popleft()
+            _bfs_iter += 1
+            _ti = _time.time()
+
+            if _bfs_iter <= 50 or _bfs_iter % 20 == 0:
+                _log.info("  [BFS #%d] table=%s  sd=%d su=%d  queue=%d  results=%d",
+                          _bfs_iter, current_table, sd, su, len(queue), len(results))
+
+            # ── Шаги ВНИЗ ──
+            # Длина пути до дочернего узла = sd+su+1; не превышаем max_depth_down + max_depth_up
+            if sd < max_depth_down and (sd + su + 1) <= (max_depth_down + max_depth_up):
+                _tf = _time.time()
+                forward_rels = self.get_related_tables(current_table)
+                _elapsed_fwd = _time.time() - _tf
+                if _elapsed_fwd > 1.0:
+                    _log.warning("    ↓ get_related_tables(%s) SLOW: %.1fs  (%d fields)", current_table, _elapsed_fwd, len(forward_rels))
+
+                for field_name, target_table in forward_rels.items():
+                    if not self.analyzer.table_exists(target_table):
+                        continue
+
+                    new_sd = sd + 1
+                    new_su = su
+                    rk = f"{current_table}|{field_name}|{target_table}|fwd|sd{new_sd}_su{new_su}"
+                    if rk in visited_keys:
+                        continue
+                    visited_keys.add(rk)
+
+                    target_alias = _get_alias(target_table, current_table, field_name)
+                    source_alias = _get_alias(current_table) if current_table != normalized_base else self._generate_table_alias(current_table, structure_parser)
+
+                    results.append({
+                        'source_table': current_table,
+                        'source_alias': source_alias,
+                        'field_name': field_name,
+                        'target_table': target_table,
+                        'target_alias': target_alias,
+                        'direction': 'forward',
+                        'steps_down': new_sd,
+                        'steps_up': new_su,
+                        'depth': new_sd + new_su,
+                        'relationship_key': rk,
+                    })
+
+                    if new_sd < max_depth_down or new_su < max_depth_up:
+                        queue.append((target_table, new_sd, new_su))
+
+            # ── Шаги ВВЕРХ ──
+            # Длина пути до дочернего узла = sd+su+1; не превышаем max_depth_down + max_depth_up
+            if su < max_depth_up and (sd + su + 1) <= (max_depth_down + max_depth_up):
+                rev_rels = _find_reverse_for_table(current_table)
+                for rev_rel in rev_rels:
+                    src_table = rev_rel['source_table']
+                    field_name = rev_rel['field_name']
+
+                    new_sd = sd
+                    new_su = su + 1
+                    rk = f"{src_table}|{field_name}|{current_table}|rev|sd{new_sd}_su{new_su}"
+                    if rk in visited_keys:
+                        continue
+                    visited_keys.add(rk)
+
+                    source_alias = _get_alias(src_table, current_table, field_name)
+                    target_alias = self._generate_table_alias(current_table, structure_parser)
+
+                    results.append({
+                        'source_table': src_table,
+                        'source_alias': source_alias,
+                        'field_name': field_name,
+                        'target_table': current_table,
+                        'target_alias': target_alias,
+                        'direction': 'reverse',
+                        'steps_down': new_sd,
+                        'steps_up': new_su,
+                        'depth': new_sd + new_su,
+                        'relationship_key': rk,
+                    })
+
+                    if new_sd < max_depth_down or new_su < max_depth_up:
+                        queue.append((src_table, new_sd, new_su))
+
+        _elapsed_total = _time.time() - _t0
+        _log.info("══ END build_mixed_graph ══  results=%d  bfs_iters=%d  visited=%d  total=%.1fs",
+                  len(results), _bfs_iter, len(visited_keys), _elapsed_total)
+
+        results = self.filter_graph(results, normalized_base, base_table, max_depth_down, max_depth_up)
+        _log.info("  after filter_graph: kept %d rels", len(results))
+
+        return results
+
+    @staticmethod
+    def filter_graph(
+        results: List[Dict],
+        normalized_base: str,
+        base_table: str,
+        max_depth_down: int,
+        max_depth_up: int
+    ) -> List[Dict]:
+        """
+        Постобработка графа:
+        1) Исключает «возвраты» — пары соседних рёбер (прямое + обратное)
+           по одной паре таблиц/полей в противоположных направлениях.
+           Возвратное ребро и вся ветвь за ним удаляются.
+        2) Исключает связи с tree_path_length > max_depth_down + max_depth_up.
+
+        Вызывается как при построении графа (build_mixed_graph),
+        так и при загрузке из файла.
+        """
+        max_path = max_depth_down + max_depth_up
+
+        # Строим дерево: parent → [child_rels]
+        _children: Dict[str, List[Dict]] = {}
+        for rel in results:
+            direction = rel.get('direction', 'forward')
+            parent = rel['source_table'] if direction == 'forward' else rel['target_table']
+            _children.setdefault(parent, []).append(rel)
+        for k in _children:
+            _children[k].sort(key=lambda r: (0 if r.get('direction') != 'reverse' else 1))
+
+        def _is_return_edge(parent_rel, child_rel):
+            """child_rel — возврат по parent_rel (одна пара таблиц, противоположные направления, любые поля)."""
+            if not parent_rel:
+                return False
+            return (
+                parent_rel['source_table'] == child_rel['source_table']
+                and parent_rel['target_table'] == child_rel['target_table']
+                and parent_rel.get('direction') != child_rel.get('direction')
+            )
+
+        kept_rk: Set[str] = set()
+        rel_key_to_path_length: Dict[str, int] = {}
+        visited_rk: Set[str] = set()
+
+        def _dfs_filter(table_name: str, path_len: int, parent_rel):
+            for rel in _children.get(table_name, []):
+                rk = rel['relationship_key']
+                if rk in visited_rk:
+                    continue
+                visited_rk.add(rk)
+                if _is_return_edge(parent_rel, rel):
+                    continue
+                child_path = path_len + 1
+                if child_path > max_path:
+                    continue
+                rel_key_to_path_length[rk] = child_path
+                kept_rk.add(rk)
+                direction = rel.get('direction', 'forward')
+                child = rel['target_table'] if direction == 'forward' else rel['source_table']
+                _dfs_filter(child, child_path, rel)
+
+        _dfs_filter(normalized_base, 0, None)
+        if normalized_base != base_table:
+            _dfs_filter(base_table, 0, None)
+
+        # Повторный проход: запускаем DFS из таблиц, достигнутых основным DFS,
+        # но чьи дочерние рёбра ещё не обработаны (например, Doc653 достигнут через VT)
+        _rk_to_rel = {r['relationship_key']: r for r in results}
+        _visited_tables: Set[str] = {normalized_base, base_table}
+        changed = True
+        while changed:
+            changed = False
+            for rk in list(kept_rk):
+                rel = _rk_to_rel.get(rk)
+                if not rel:
+                    continue
+                direction = rel.get('direction', 'forward')
+                child = rel['target_table'] if direction == 'forward' else rel['source_table']
+                if child not in _visited_tables and child in _children:
+                    _visited_tables.add(child)
+                    _dfs_filter(child, rel_key_to_path_length[rk], rel)
+                    changed = True
+
+        # Сироты: связи, не достигнутые DFS. Фильтруем по max_path и по возвратам.
+        # Индекс принятых рёбер: (source_table, target_table, direction) — без field_name
+        _kept_edge_keys: Set[tuple] = set()
+        for r in results:
+            if r['relationship_key'] in kept_rk:
+                _kept_edge_keys.add((r['source_table'], r['target_table'], r.get('direction', 'forward')))
+
+        for rel in results:
+            rk = rel['relationship_key']
+            if rk in visited_rk:
+                continue
+            visited_rk.add(rk)
+            pl = rel.get('steps_down', 0) + rel.get('steps_up', 0)
+            if pl > max_path:
+                continue
+            # Проверка на возврат: если ребро с теми же таблицами но противоположным направлением уже принято
+            src, tgt = rel['source_table'], rel['target_table']
+            opposite_dir = 'reverse' if rel.get('direction', 'forward') == 'forward' else 'forward'
+            if (src, tgt, opposite_dir) in _kept_edge_keys:
+                continue
+            rel_key_to_path_length[rk] = pl
+            kept_rk.add(rk)
+            _kept_edge_keys.add((src, tgt, rel.get('direction', 'forward')))
+
+        return [r for r in results if r['relationship_key'] in kept_rk]
+
     def collect_all_relationships_for_display(self, base_table: str, structure_parser=None) -> List[Dict]:
         """
         Собирает все связи (прямые и обратные) с базовой таблицей для отображения в UI.

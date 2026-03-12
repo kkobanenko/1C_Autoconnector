@@ -75,7 +75,6 @@ def get_connection_string_from_params(host: str, database: str, username: str, p
         f"PWD={password};"
         f"Encrypt=yes;"
         f"TrustServerCertificate=yes;"
-        f"Connection Timeout=10;"
     )
 
 
