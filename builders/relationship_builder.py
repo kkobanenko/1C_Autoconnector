@@ -764,7 +764,8 @@ class RelationshipBuilder:
         _log.info("══ END build_mixed_graph ══  results=%d  bfs_iters=%d  visited=%d  total=%.1fs",
                   len(results), _bfs_iter, len(visited_keys), _elapsed_total)
 
-        results = self.filter_graph(results, normalized_base, base_table, max_depth_down, max_depth_up)
+        results = self.filter_graph(results, normalized_base, base_table, max_depth_down, max_depth_up,
+                                     normalize_fn=self._normalize_table_name)
         _log.info("  after filter_graph: kept %d rels", len(results))
 
         return results
@@ -775,14 +776,22 @@ class RelationshipBuilder:
         normalized_base: str,
         base_table: str,
         max_depth_down: int,
-        max_depth_up: int
+        max_depth_up: int,
+        normalize_fn=None
     ) -> List[Dict]:
         """
         Постобработка графа:
         1) Исключает «возвраты» — пары соседних рёбер (прямое + обратное)
            по одной паре таблиц/полей в противоположных направлениях.
            Возвратное ребро и вся ветвь за ним удаляются.
-        2) Исключает связи с tree_path_length > max_depth_down + max_depth_up.
+        2) Исключает связи, где накопительные sd > max_depth_down или su > max_depth_up
+           по DFS-пути от корня.
+
+        Args:
+            normalize_fn: Функция нормализации имени таблицы (опционально).
+                          Если передана, _children индексируются и по оригинальному,
+                          и по нормализованному имени parent — чтобы DFS из normalized_base
+                          нашёл reverse-связи корня.
 
         Вызывается как при построении графа (build_mixed_graph),
         так и при загрузке из файла.
@@ -794,7 +803,15 @@ class RelationshipBuilder:
         for rel in results:
             direction = rel.get('direction', 'forward')
             parent = rel['source_table'] if direction == 'forward' else rel['target_table']
+            # Добавляем под оригинальным именем
             _children.setdefault(parent, []).append(rel)
+            # Добавляем под нормализованным именем (если есть нормализатор)
+            if normalize_fn:
+                pn = normalize_fn(parent)
+                if pn != parent:
+                    lst = _children.setdefault(pn, [])
+                    if rel not in lst:
+                        lst.append(rel)
         for k in _children:
             _children[k].sort(key=lambda r: (0 if r.get('direction') != 'reverse' else 1))
 
@@ -810,28 +827,49 @@ class RelationshipBuilder:
 
         kept_rk: Set[str] = set()
         rel_key_to_path_length: Dict[str, int] = {}
+        # Храним накопительные sd/su для каждого принятого ребра
+        _rk_to_sd: Dict[str, int] = {}
+        _rk_to_su: Dict[str, int] = {}
         visited_rk: Set[str] = set()
 
-        def _dfs_filter(table_name: str, path_len: int, parent_rel):
+        def _dfs_filter(table_name: str, parent_sd: int, parent_su: int, parent_rel, table_path: Set[str]):
+            """parent_sd/parent_su — накопительные шаги вниз/вверх от корня до parent."""
             for rel in _children.get(table_name, []):
                 rk = rel['relationship_key']
                 if rk in visited_rk:
                     continue
-                visited_rk.add(rk)
                 if _is_return_edge(parent_rel, rel):
                     continue
-                child_path = path_len + 1
+                direction = rel.get('direction', 'forward')
+                # Вычисляем накопительные sd/su
+                if direction == 'forward':
+                    child_sd = parent_sd + 1
+                    child_su = parent_su
+                else:
+                    child_sd = parent_sd
+                    child_su = parent_su + 1
+                # Ограничение по sd/su
+                if child_sd > max_depth_down or child_su > max_depth_up:
+                    continue
+                child_path = child_sd + child_su
                 if child_path > max_path:
                     continue
+                visited_rk.add(rk)
                 rel_key_to_path_length[rk] = child_path
+                _rk_to_sd[rk] = child_sd
+                _rk_to_su[rk] = child_su
                 kept_rk.add(rk)
-                direction = rel.get('direction', 'forward')
                 child = rel['target_table'] if direction == 'forward' else rel['source_table']
-                _dfs_filter(child, child_path, rel)
+                child_norm = normalize_fn(child) if normalize_fn else child
+                if child in table_path or child_norm in table_path:
+                    continue
+                _dfs_filter(child, child_sd, child_su, rel, table_path | {child, child_norm})
 
-        _dfs_filter(normalized_base, 0, None)
+        _root_norm = normalize_fn(normalized_base) if normalize_fn else normalized_base
+        _dfs_filter(normalized_base, 0, 0, None, {normalized_base, _root_norm})
         if normalized_base != base_table:
-            _dfs_filter(base_table, 0, None)
+            _base_norm = normalize_fn(base_table) if normalize_fn else base_table
+            _dfs_filter(base_table, 0, 0, None, {base_table, _base_norm})
 
         # Повторный проход: запускаем DFS из таблиц, достигнутых основным DFS,
         # но чьи дочерние рёбра ещё не обработаны (например, Doc653 достигнут через VT)
@@ -848,11 +886,11 @@ class RelationshipBuilder:
                 child = rel['target_table'] if direction == 'forward' else rel['source_table']
                 if child not in _visited_tables and child in _children:
                     _visited_tables.add(child)
-                    _dfs_filter(child, rel_key_to_path_length[rk], rel)
+                    child_norm = normalize_fn(child) if normalize_fn else child
+                    _dfs_filter(child, _rk_to_sd.get(rk, 0), _rk_to_su.get(rk, 0), rel, {child, child_norm})
                     changed = True
 
-        # Сироты: связи, не достигнутые DFS. Фильтруем по max_path и по возвратам.
-        # Индекс принятых рёбер: (source_table, target_table, direction) — без field_name
+        # Сироты: связи, не достигнутые DFS. Фильтруем по sd/su и по возвратам.
         _kept_edge_keys: Set[tuple] = set()
         for r in results:
             if r['relationship_key'] in kept_rk:
@@ -863,10 +901,13 @@ class RelationshipBuilder:
             if rk in visited_rk:
                 continue
             visited_rk.add(rk)
-            pl = rel.get('steps_down', 0) + rel.get('steps_up', 0)
+            sd = rel.get('steps_down', 0)
+            su = rel.get('steps_up', 0)
+            if sd > max_depth_down or su > max_depth_up:
+                continue
+            pl = sd + su
             if pl > max_path:
                 continue
-            # Проверка на возврат: если ребро с теми же таблицами но противоположным направлением уже принято
             src, tgt = rel['source_table'], rel['target_table']
             opposite_dir = 'reverse' if rel.get('direction', 'forward') == 'forward' else 'forward'
             if (src, tgt, opposite_dir) in _kept_edge_keys:

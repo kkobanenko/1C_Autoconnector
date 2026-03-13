@@ -206,7 +206,92 @@ class ViewGenerator:
         _collect_relationships_recursive(fact_table_db, main_alias, 0, max_depth)
         
         return relationships
-    
+
+    def get_effective_relationships(
+        self,
+        fact_table: str,
+        relationships: List[Dict],
+        table_config: Dict[str, Dict]
+    ) -> Tuple[List[Dict], Set[str]]:
+        """
+        Возвращает связи для визуализации/SQL: включённые + транзитные (путь к включённым).
+        Используется в «Визуализировать конфигурацию» и совпадает с набором JOIN в SQL.
+
+        Returns:
+            (list of relationships, set of transit-only relationship_keys)
+        """
+        fact_table_db = self._resolve_table_name(fact_table)
+        if not fact_table_db:
+            return [], set()
+        if fact_table.strip().startswith('_') and not fact_table_db.startswith('_'):
+            table_with_underscore = '_' + fact_table_db.lstrip('_')
+            if self.analyzer.table_exists(table_with_underscore):
+                fact_table_db = table_with_underscore
+
+        rb_norm = self.relationship_builder._normalize_table_name
+        norm_root = rb_norm(fact_table_db)
+
+        children: Dict[str, List[Dict]] = {}
+        for rel in relationships:
+            direction = rel.get('direction', 'forward')
+            parent = rel['source_table'] if direction == 'forward' else rel['target_table']
+            pn = rb_norm(parent)
+            for key in (parent, pn):
+                if rel not in children.setdefault(key, []):
+                    children[key].append(rel)
+        for k in children:
+            children[k].sort(key=lambda r: (0 if r.get('direction') != 'reverse' else 1))
+
+        enabled_targets: Set[str] = set()
+        for rel in relationships:
+            if table_config.get(rel['relationship_key'], {}).get('enabled', False):
+                direction = rel.get('direction', 'forward')
+                joined = rel['target_table'] if direction == 'forward' else rel['source_table']
+                enabled_targets.add(joined)
+                enabled_targets.add(rb_norm(joined))
+
+        changed = True
+        while changed:
+            changed = False
+            for rel in relationships:
+                direction = rel.get('direction', 'forward')
+                child = rel['target_table'] if direction == 'forward' else rel['source_table']
+                cn = rb_norm(child)
+                if cn in enabled_targets or child in enabled_targets:
+                    parent = rel['source_table'] if direction == 'forward' else rel['target_table']
+                    pn = rb_norm(parent)
+                    if pn not in enabled_targets and parent not in enabled_targets:
+                        enabled_targets.add(pn)
+                        enabled_targets.add(parent)
+                        changed = True
+
+        result, visited, transit_only_rks = [], set(), set()
+
+        def _dfs(t):
+            tn = rb_norm(t)
+            for key in (t, tn):
+                for rel in children.get(key, []):
+                    rk = rel['relationship_key']
+                    if rk in visited:
+                        continue
+                    visited.add(rk)
+                    direction = rel.get('direction', 'forward')
+                    child = rel['target_table'] if direction == 'forward' else rel['source_table']
+                    cn = rb_norm(child)
+                    is_enabled = table_config.get(rk, {}).get('enabled', False)
+                    is_needed = cn in enabled_targets or child in enabled_targets
+                    if is_enabled:
+                        result.append(rel)
+                    elif is_needed:
+                        result.append(rel)
+                        transit_only_rks.add(rk)
+                    _dfs(child)
+
+        _dfs(norm_root)
+        if norm_root != fact_table_db:
+            _dfs(fact_table_db)
+        return result, transit_only_rks
+
     def generate_view_from_relationships(
         self,
         fact_table: str,
@@ -290,7 +375,7 @@ class ViewGenerator:
         main_alias = next(iter(root_aliases))
         self.table_aliases[fact_table_db] = main_alias
 
-        # DFS-порядок связей (как в UI)
+        # DFS-порядок связей (как в UI). Включаем транзитные связи — путь к включённым таблицам.
         def _build_dfs_order():
             children: Dict[str, List[Dict]] = {}
             for rel in relationships:
@@ -302,7 +387,45 @@ class ViewGenerator:
                         children[key].append(rel)
             for k in children:
                 children[k].sort(key=lambda r: (0 if r.get('direction') != 'reverse' else 1))
+
+            # Таблицы, до которых нужно дойти: включённые + их родители по пути от корня
+            enabled_targets: Set[str] = set()
+            for rel in relationships:
+                if table_config.get(rel['relationship_key'], {}).get('enabled', False):
+                    direction = rel.get('direction', 'forward')
+                    joined = rel['target_table'] if direction == 'forward' else rel['source_table']
+                    enabled_targets.add(joined)
+                    enabled_targets.add(rb_norm(joined))
+
+            # Расширяем: добавляем родительские таблицы на путях к enabled_targets
+            parent_of: Dict[str, str] = {}  # child -> parent (любой родитель по какому-то ребру)
+            for rel in relationships:
+                direction = rel.get('direction', 'forward')
+                parent = rel['source_table'] if direction == 'forward' else rel['target_table']
+                child = rel['target_table'] if direction == 'forward' else rel['source_table']
+                for cn in (child, rb_norm(child)):
+                    if cn not in parent_of:
+                        parent_of[cn] = parent
+            changed = True
+            while changed:
+                changed = False
+                for rel in relationships:
+                    direction = rel.get('direction', 'forward')
+                    child = rel['target_table'] if direction == 'forward' else rel['source_table']
+                    cn = rb_norm(child)
+                    if cn in enabled_targets or child in enabled_targets:
+                        parent = rel['source_table'] if direction == 'forward' else rel['target_table']
+                        pn = rb_norm(parent)
+                        if pn not in enabled_targets and parent not in enabled_targets:
+                            enabled_targets.add(pn)
+                            enabled_targets.add(parent)
+                            changed = True
+
+            # Транзитные связи: нужны для пути, но не включены пользователем (не добавляем их поля)
+            transit_only_rks: Set[str] = set()
+
             result, visited = [], set()
+
             def _dfs(t):
                 tn = rb_norm(t)
                 for key in (t, tn):
@@ -311,17 +434,24 @@ class ViewGenerator:
                         if rk in visited:
                             continue
                         visited.add(rk)
-                        if table_config.get(rk, {}).get('enabled', False):
-                            result.append(rel)
                         direction = rel.get('direction', 'forward')
                         child = rel['target_table'] if direction == 'forward' else rel['source_table']
+                        cn = rb_norm(child)
+                        is_enabled = table_config.get(rk, {}).get('enabled', False)
+                        is_needed = cn in enabled_targets or child in enabled_targets
+                        if is_enabled:
+                            result.append(rel)
+                        elif is_needed:
+                            result.append(rel)
+                            transit_only_rks.add(rk)
                         _dfs(child)
+
             _dfs(rb_norm(fact_table_db))
             if rb_norm(fact_table_db) != fact_table_db:
                 _dfs(fact_table_db)
-            return result
+            return result, transit_only_rks
 
-        sorted_rels = _build_dfs_order()
+        sorted_rels, transit_only_rks = _build_dfs_order()
 
         def _ensure_unique_alias(base_alias: str) -> str:
             """Создаёт уникальный алиас колонки."""
@@ -437,7 +567,9 @@ class ViewGenerator:
             self.table_aliases[new_table] = new_alias
             joined_aliases.add(new_alias)
 
-            _add_fields_for_table(new_table, new_alias, rk, is_root=False)
+            # Транзитные связи: только JOIN, поля не добавляем
+            if rk not in transit_only_rks:
+                _add_fields_for_table(new_table, new_alias, rk, is_root=False)
 
         if not self.selected_fields:
             raise ValueError(

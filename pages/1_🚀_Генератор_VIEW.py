@@ -884,7 +884,20 @@ st.markdown("---")
 # ═══════════════════════════════════════════════════════════════════════════
 # СЕКЦИЯ 5: ПАРАМЕТРЫ (Этапы 3-4)
 # ═══════════════════════════════════════════════════════════════════════════
-st.header("7. ⚙️ Параметры")
+st.header("7. ⚙️ Параметры", help=(
+    "Параметры построения графа связей и генерации SQL.\n\n"
+    "• **Рекурсия вниз (↓)** — сколько уровней прямых ссылок (binary(16) → _IDRRef) "
+    "обходить от корневой таблицы. Каждый уровень добавляет справочники, "
+    "на которые ссылаются поля текущего уровня.\n\n"
+    "• **Рекурсия вверх (↑)** — сколько уровней обратных связей включать. "
+    "Обратная связь — это таблица, которая сама ссылается на текущую "
+    "(например, табличная часть документа). 0 = только прямые связи.\n\n"
+    "• **Исправлять даты 1С** — если включено, даты ≥ 3000 года сдвигаются "
+    "на −2000 лет (стандартная коррекция 1С:Предприятие).\n\n"
+    "• **Именование полей** — стиль алиасов колонок в SQL:\n"
+    "  - *Таблица.Поле* — `Справочник.Контрагенты.Наименование`\n"
+    "  - *Алиас_Поле* — `Справочник_Контрагенты_Наименование`"
+))
 
 # Загружаем сохранённые параметры
 _def_depth = _saved_ui.get('param_max_depth', 5)
@@ -1049,7 +1062,14 @@ def _load_graph(filepath):
         norm_base = base_table.strip('[]')
         if not norm_base.startswith('_'):
             norm_base = '_' + norm_base
-        rels = RelationshipBuilder.filter_graph(rels, norm_base, base_table, max_down, max_up)
+        # Нормализатор для filter_graph: strip [] + ensure _ prefix
+        def _simple_norm(t):
+            t = t.strip('[]')
+            if not t.startswith('_'):
+                t = '_' + t
+            return t
+        rels = RelationshipBuilder.filter_graph(rels, norm_base, base_table, max_down, max_up,
+                                                normalize_fn=_simple_norm)
     return rels, meta
 
 def _delete_graph(filepath):
@@ -1391,6 +1411,15 @@ def _render_config_section():
     st.header("10. 🗂️ Настройка таблиц и связей")
     st.caption(f"Найдено {len(relationships)} связей. Отключите ненужные таблицы/поля или измените тип JOIN.")
 
+    # Поиск в полях связей — в начале секции для видимости без прокрутки
+    search_in_rels = st.text_input(
+        "Поиск в полях связей",
+        value=st.session_state.get('gen_filter_search', ''),
+        key="gen_filter_search",
+        placeholder="Подстрока в таблицах, полях (без учёта регистра). Пусто — показывать все.",
+        help="Поиск без учёта регистра в именах таблиц и полей. Пусто — показывать все."
+    )
+
     # Глобальный параметр: показывать мусорные поля (влияет только на отображение, не на признак выбора)
     show_junk_fields = st.checkbox(
         "🗑️ Показывать мусорные поля",
@@ -1469,17 +1498,39 @@ def _render_config_section():
 
     # Строим порядок DFS: дочерние таблицы показываются сразу под родителем.
     # tree_indent, tree_level, tree_path_length — по дереву (вниз +1, вверх -1)
+    # Накопительные sd/su по пути ограничиваются max_depth_down/max_depth_up.
     def _build_dfs_order():
         """Строит плоский список relationships в порядке DFS и rel_key_to_indent/level/path_length/path."""
+        # Лимиты глубины из session_state (сохраняются при построении/загрузке графа)
+        _max_dd = st.session_state.get('gen_graph_max_depth') or st.session_state.get('gen_max_depth', 999)
+        _max_du = st.session_state.get('gen_graph_max_depth_up') or st.session_state.get('gen_max_depth_up', 999)
+        if not isinstance(_max_dd, int):
+            try:
+                _max_dd = int(_max_dd)
+            except (TypeError, ValueError):
+                _max_dd = 999
+        if not isinstance(_max_du, int):
+            try:
+                _max_du = int(_max_du)
+            except (TypeError, ValueError):
+                _max_du = 999
+
         _children = {}
+        _norm = analyzer._normalize_table_name
         for rel in relationships:
             direction = rel.get('direction', 'forward')
             parent = rel['source_table'] if direction == 'forward' else rel['target_table']
-            _children.setdefault(parent, []).append(rel)
+            # Добавляем под оригинальным и нормализованным именем parent,
+            # чтобы DFS из norm_root нашёл reverse-связи корня (ключ "_Document653" vs "Document653").
+            parent_norm = _norm(parent)
+            for pkey in (parent, parent_norm):
+                lst = _children.setdefault(pkey, [])
+                if rel not in lst:
+                    lst.append(rel)
         for k in _children:
             _children[k].sort(key=lambda r: (0 if r.get('direction') != 'reverse' else 1))
 
-        norm_root = analyzer._normalize_table_name(selected_table_db)
+        norm_root = _norm(selected_table_db)
         result = []
         visited_rk = set()
         rel_key_to_indent = {}
@@ -1487,26 +1538,48 @@ def _render_config_section():
         rel_key_to_path_length = {}
         # Полный путь от корня: список relationship_key всех рёбер от корня до текущего узла
         rel_key_to_path = {}
+        # Накопительные sd/su для каждого ребра (для подписей (↓x ↑y))
+        rel_key_to_cumulative_sd = {}
+        rel_key_to_cumulative_su = {}
 
-        def _dfs(table_name, parent_indent, parent_level, parent_path_length, parent_path):
+        def _dfs(table_name, parent_indent, parent_sd, parent_su, parent_path, table_path):
+            """parent_sd/parent_su — накопительные шаги вниз/вверх от корня до parent."""
             for rel in _children.get(table_name, []):
                 rk = rel['relationship_key']
                 if rk in visited_rk:
                     continue
-                visited_rk.add(rk)
                 direction = rel.get('direction', 'forward')
+                # Вычисляем накопительные sd/su для этого ребра
+                if direction == 'forward':
+                    child_sd = parent_sd + 1
+                    child_su = parent_su
+                else:
+                    child_sd = parent_sd
+                    child_su = parent_su + 1
+                # Ограничение: не добавляем ребро, если sd > max_depth_down или su > max_depth_up
+                if child_sd > _max_dd or child_su > _max_du:
+                    continue
+                visited_rk.add(rk)
                 delta = 1 if direction == 'forward' else -1
                 child_indent = parent_indent + delta
-                child_level = parent_level + delta
-                child_path_length = parent_path_length + 1
+                child_level = child_sd - child_su
+                child_path_length = child_sd + child_su
                 child_path = parent_path + [rk]
                 rel_key_to_indent[rk] = child_indent
                 rel_key_to_level[rk] = child_level
                 rel_key_to_path_length[rk] = child_path_length
                 rel_key_to_path[rk] = child_path
+                rel_key_to_cumulative_sd[rk] = child_sd
+                rel_key_to_cumulative_su[rk] = child_su
                 result.append(rel)
                 child = rel['target_table'] if direction == 'forward' else rel['source_table']
-                _dfs(child, child_indent, child_level, child_path_length, child_path)
+                # Не заходим повторно в таблицу по текущему пути:
+                # иначе можно "вернуться" в корень из глубины и вычислить соседние рёбра
+                # корня с неверным контекстом (теряются узлы уровня -1).
+                child_norm = _norm(child)
+                if child in table_path or child_norm in table_path:
+                    continue
+                _dfs(child, child_indent, child_sd, child_su, child_path, table_path | {child, child_norm})
 
         # Если выбранная таблица — табличная часть (_VT), документ должен быть первым корнем,
         # чтобы обратная связь (табл. часть → документ) давала уровень -1.
@@ -1520,20 +1593,27 @@ def _render_config_section():
             roots_to_process.append(selected_table_db)
 
         for root in roots_to_process:
-            _dfs(root, 0, 0, 0, [])
+            _dfs(root, 0, 0, 0, [], {root, _norm(root)})
         for rel in relationships:
             if rel['relationship_key'] not in visited_rk:
                 rk = rel['relationship_key']
                 sd = rel.get('steps_down', 0)
                 su = rel.get('steps_up', 0)
+                # Сироты: проверяем лимиты sd/su
+                if sd > _max_dd or su > _max_du:
+                    continue
                 rel_key_to_indent[rk] = sd - su
                 rel_key_to_level[rk] = sd - su
                 rel_key_to_path_length[rk] = sd + su
                 rel_key_to_path[rk] = [rk]
+                rel_key_to_cumulative_sd[rk] = sd
+                rel_key_to_cumulative_su[rk] = su
                 result.append(rel)
-        return result, rel_key_to_indent, rel_key_to_level, rel_key_to_path_length, rel_key_to_path
+        return (result, rel_key_to_indent, rel_key_to_level, rel_key_to_path_length,
+                rel_key_to_path, rel_key_to_cumulative_sd, rel_key_to_cumulative_su)
 
-    _sorted_rels, _rel_key_to_indent, _rel_key_to_level, _rel_key_to_path_length, _rel_key_to_path = _build_dfs_order()
+    (_sorted_rels, _rel_key_to_indent, _rel_key_to_level, _rel_key_to_path_length,
+     _rel_key_to_path, _rel_key_to_cumulative_sd, _rel_key_to_cumulative_su) = _build_dfs_order()
 
     # Словарь rk → rel для быстрого поиска связи по ключу (нужен для отображения пути)
     _rk_to_rel = {r['relationship_key']: r for r in relationships}
@@ -1627,6 +1707,7 @@ def _render_config_section():
                 col_link, col_jt = st.columns([4, 2])
                 with col_link:
                     # Полный путь от корня до текущего узла: все рёбра с нумерацией
+                    # (↓x ↑y) — накопительные значения sd/su от корня до данного ребра
                     edge_path = _rel_key_to_path.get(rk, [rk])
                     for edge_idx, edge_rk in enumerate(edge_path, start=1):
                         edge_rel = _rk_to_rel.get(edge_rk)
@@ -1634,8 +1715,8 @@ def _render_config_section():
                             continue
                         edge_dir = edge_rel.get('direction', 'forward')
                         arrow = "→" if edge_dir == 'forward' else "←"
-                        edge_sd = edge_rel.get('steps_down', 0)
-                        edge_su = edge_rel.get('steps_up', 0)
+                        edge_sd = _rel_key_to_cumulative_sd.get(edge_rk, edge_rel.get('steps_down', 0))
+                        edge_su = _rel_key_to_cumulative_su.get(edge_rk, edge_rel.get('steps_up', 0))
                         edge_steps = f" (↓{edge_sd} ↑{edge_su})" if (edge_sd or edge_su) else ""
                         st.caption(f"{edge_idx}. 🔗 `{edge_rel['source_table']}`.`{edge_rel['field_name']}` {arrow} `{edge_rel['target_table']}`._IDRRef{edge_steps}")
                 with col_jt:
@@ -1846,6 +1927,9 @@ def _render_config_section():
             help="Фильтр по длине пути. По умолчанию — все."
         )
 
+    # search_in_rels уже отрендерен выше (в начале секции)
+    search_in_rels = st.session_state.get('gen_filter_search', '')
+
     # Пустой выбор = показывать все (fallback при первом рендере)
     _filter_by_level = set(selected_levels) if selected_levels else set(_all_levels)
     _filter_by_path = set(selected_path_lengths) if selected_path_lengths else set(_all_path_lengths)
@@ -1858,6 +1942,51 @@ def _render_config_section():
     ]
     if show_only_selected:
         _rels_to_show = [r for r in _rels_to_show if _rel_n_included.get(r['relationship_key'], 0) > 0]
+
+    # Фильтр по поиску в полях связей (по узлам): ищем во всём тексте узла
+    _search_str = (search_in_rels or '').strip()
+    if _search_str:
+        _search_lower = _search_str.lower()
+
+        def _node_for_rel(r):
+            direction = r.get('direction', 'forward')
+            return r['target_table'] if direction == 'forward' else r['source_table']
+
+        def _build_searchable_text_for_rel(r):
+            """Собирает весь текст узла для поиска: человеческое/техническое имя таблицы, рёбра пути, человеческие имена полей."""
+            direction = r.get('direction', 'forward')
+            show_table = r['source_table'] if direction == 'reverse' else r['target_table']
+            parts = []
+            human_show = sp.get_table_human_name(show_table) if sp else None
+            if human_show:
+                parts.append(human_show)
+            parts.append(show_table)
+            edge_path = _rel_key_to_path.get(r['relationship_key'], [r['relationship_key']])
+            for edge_rk in edge_path:
+                edge_rel = _rk_to_rel.get(edge_rk)
+                if not edge_rel:
+                    continue
+                src = edge_rel.get('source_table', '')
+                tgt = edge_rel.get('target_table', '')
+                fld = edge_rel.get('field_name', '')
+                parts.extend([src, tgt, fld])
+                human_fld = sp.get_field_human_name(src, fld) if sp else None
+                if human_fld:
+                    parts.append(human_fld)
+                arrow = "→" if edge_rel.get('direction') == 'forward' else "←"
+                parts.append(f"{src}.{fld} {arrow} {tgt}._IDRRef")
+            return " ".join(str(p) for p in parts).lower()
+
+        def _rel_path_matches_search(r):
+            searchable = _build_searchable_text_for_rel(r)
+            return _search_lower in searchable
+
+        # Строим matching_nodes по полному графу: узел входит, если хотя бы одна его связь совпадает
+        _matching_nodes = set()
+        for r in _sorted_rels:
+            if _rel_path_matches_search(r):
+                _matching_nodes.add(_node_for_rel(r))
+        _rels_to_show = [r for r in _rels_to_show if _node_for_rel(r) in _matching_nodes]
 
     # Номера всегда из полного списка _sorted_rels (для поиска таблицы при переключении режимов)
     _rel_key_to_full_num = {r['relationship_key']: i + 1 for i, r in enumerate(_sorted_rels)}
@@ -1878,7 +2007,12 @@ def _render_config_section():
     elif show_only_selected and not _rels_to_show:
         st.info("ℹ️ Нет таблиц с выбранными полями. Снимите флажок «Показывать только выбранное» или выберите поля в таблицах.")
     elif not _rels_to_show:
-        st.info("ℹ️ Нет таблиц по выбранным фильтрам (уровень/длина пути). Расширьте выбор в фильтрах.")
+        _msg = "ℹ️ Нет таблиц по выбранным фильтрам"
+        if _search_str:
+            _msg += " (уровень/длина пути/поиск)"
+        else:
+            _msg += " (уровень/длина пути)"
+        st.info(_msg + ". Расширьте выбор в фильтрах.")
     else:
         page_start = page * REL_PER_PAGE
         page_end = min(page_start + REL_PER_PAGE, n_total)
@@ -2316,8 +2450,73 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
             with st.spinner("Отрисовка графа конфигурации..."):
                 try:
                     from utils.guid_index_visualizer import render_relationship_graph
-                    # Только выбранные таблицы (enabled)
-                    _config_rels = [r for r in relationships if table_config.get(r['relationship_key'], {}).get('enabled')]
+                    # Включённые + транзитные связи по фактическим путям включённых узлов.
+                    # Строим локальную карту путей для секции 11 (она вне _render_config_section).
+                    _an = st.session_state.gen_analyzer
+
+                    def _build_viz_paths():
+                        _children = {}
+                        _vn = _an._normalize_table_name
+                        for _rel in relationships:
+                            _dir = _rel.get('direction', 'forward')
+                            _parent = _rel['source_table'] if _dir == 'forward' else _rel['target_table']
+                            _parent_norm = _vn(_parent)
+                            for _pkey in (_parent, _parent_norm):
+                                _lst = _children.setdefault(_pkey, [])
+                                if _rel not in _lst:
+                                    _lst.append(_rel)
+                        for _k in _children:
+                            _children[_k].sort(key=lambda _r: (0 if _r.get('direction') != 'reverse' else 1))
+
+                        _norm_root = _vn(selected_table_db)
+                        _ordered = []
+                        _visited = set()
+                        _rk_to_path = {}
+
+                        def _dfs(_table, _parent_path, _table_path):
+                            for _rel in _children.get(_table, []):
+                                _rk = _rel['relationship_key']
+                                if _rk in _visited:
+                                    continue
+                                _visited.add(_rk)
+                                _path = _parent_path + [_rk]
+                                _rk_to_path[_rk] = _path
+                                _ordered.append(_rel)
+                                _dir = _rel.get('direction', 'forward')
+                                _child = _rel['target_table'] if _dir == 'forward' else _rel['source_table']
+                                _child_norm = _vn(_child)
+                                if _child in _table_path or _child_norm in _table_path:
+                                    continue
+                                _dfs(_child, _path, _table_path | {_child, _child_norm})
+
+                        _roots = []
+                        if _norm_root:
+                            _roots.append(_norm_root)
+                        if selected_table_db not in _roots:
+                            _roots.append(selected_table_db)
+                        for _root in _roots:
+                            _dfs(_root, [], {_root, _vn(_root)})
+
+                        for _rel in relationships:
+                            _rk = _rel['relationship_key']
+                            if _rk not in _rk_to_path:
+                                _rk_to_path[_rk] = [_rk]
+                                _ordered.append(_rel)
+
+                        return _ordered, _rk_to_path
+
+                    _viz_sorted_rels, _viz_rel_key_to_path = _build_viz_paths()
+
+                    _enabled_rks = {
+                        rk for rk, cfg in table_config.items()
+                        if cfg.get('enabled')
+                    }
+                    _effective_rks = set(_enabled_rks)
+                    for _rk in _enabled_rks:
+                        for _path_rk in _viz_rel_key_to_path.get(_rk, [_rk]):
+                            _effective_rks.add(_path_rk)
+                    _transit_rks = _effective_rks - _enabled_rks
+                    _config_rels = [r for r in _viz_sorted_rels if r['relationship_key'] in _effective_rks]
                     viz_dir = Path(config.DEFAULT_OUTPUT_DIR) / "visualizations"
                     viz_dir.mkdir(parents=True, exist_ok=True)
                     from datetime import datetime as _dt_viz
@@ -2341,8 +2540,11 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                             _cols = _get_table_columns_cached(st.session_state.connection_string, _tbl)
                             if _cols:
                                 _n = len(_cols)
-                                _excl = len(excluded_fields.get(rel['relationship_key'], set()))
-                                _node_counts[_tbl] = (_n - _excl, _n)
+                                if rel['relationship_key'] in _transit_rks:
+                                    _node_counts[_tbl] = (0, _n)
+                                else:
+                                    _excl = len(excluded_fields.get(rel['relationship_key'], set()))
+                                    _node_counts[_tbl] = (_n - _excl, _n)
                     render_relationship_graph(
                         relationships=_config_rels,
                         fact_table=selected_table_db,
