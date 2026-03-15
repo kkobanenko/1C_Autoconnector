@@ -1162,11 +1162,12 @@ if saved_graphs:
                     st.session_state.gen_graph_built_at = meta.get('built_at')
                     st.session_state.gen_graph_max_depth = meta.get('max_depth')
                     st.session_state.gen_graph_max_depth_up = meta.get('max_depth_up')
-                    # Инициализируем конфигурацию
+                    # Инициализируем конфигурацию (дефолт: все поля не выбраны)
                     tc = {}
                     for rel in rels:
                         tc[rel['relationship_key']] = {'enabled': False, 'join_type': 'INNER JOIN'}
                     st.session_state.gen_table_config = tc
+                    st.session_state.gen_excluded_fields = {}
                     _save_ui_state({'gen_graph_hash': meta.get('graph_hash')})
                     # Проверяем актуальность
                     saved_hash = meta.get('graph_hash')
@@ -1293,7 +1294,7 @@ if st.button("🔍 Построить граф связей", type="primary", ke
                 st.session_state.gen_graph_max_depth_up = max_depth_up
                 _save_ui_state({'gen_graph_hash': _new_hash})
 
-                # Инициализируем конфигурацию таблиц (все ВЫКЛЮЧЕНЫ по умолчанию)
+                # Инициализируем конфигурацию таблиц (все ВЫКЛЮЧЕНЫ по умолчанию, все поля не выбраны)
                 table_config = {}
                 for rel in relationships:
                     table_config[rel['relationship_key']] = {
@@ -1301,6 +1302,7 @@ if st.button("🔍 Построить граф связей", type="primary", ke
                         'join_type': 'INNER JOIN'
                     }
                 st.session_state.gen_table_config = table_config
+                st.session_state.gen_excluded_fields = {}
 
                 # Сохраняем граф на диск (с хэшем)
                 st.write("💾 Сохранение графа на диск...")
@@ -2132,10 +2134,21 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
         for rel in _pre_relationships:
             tc_new[rel['relationship_key']] = {'enabled': False, 'join_type': 'INNER JOIN'}
         st.session_state.gen_table_config = tc_new
-        st.session_state.gen_excluded_fields = {}
+        # Дефолт «все поля не выбраны»: excluded = {key: set(все колонки)} для корня и всех связей
+        excl_all = {}
+        _root_key = f"__root__{_pre_selected_table_db}"
+        _root_cols = _get_table_columns_cached(st.session_state.connection_string, _pre_selected_table_db)
+        excl_all[_root_key] = {c[0] for c in (_root_cols or [])}
+        for _rel in _pre_relationships:
+            _rk = _rel['relationship_key']
+            _dir = _rel.get('direction', 'forward')
+            _tbl = _rel['target_table'] if _dir == 'forward' else _rel['source_table']
+            _cols = _get_table_columns_cached(st.session_state.connection_string, _tbl)
+            excl_all[_rk] = {c[0] for c in (_cols or [])}
+        st.session_state.gen_excluded_fields = excl_all
         st.session_state._pending_cfg_load = {
             'table_config': tc_new,
-            'excluded_fields': {},
+            'excluded_fields': excl_all,
         }
         st.rerun()
 
@@ -2223,9 +2236,28 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                             pass
                         st.rerun()
 
-                if st.session_state.get(f"_pre_cfg_detail_{i}", False):
-                    _cfg_edges = cm.get('edges', [])
-                    td_list = cm.get('tables_detail', [])
+                if st.session_state.get(detail_key, False):
+                    # Загружаем полный файл — table_config в корне, tables_detail в metadata
+                    _full_data = {}
+                    try:
+                        with open(cm['filepath'], 'r', encoding='utf-8') as _f:
+                            _full_data = json.load(_f)
+                    except Exception:
+                        pass
+                    _tc_cfg = _full_data.get('table_config', cm.get('table_config', {}))
+                    _cfg_edges = cm.get('edges', []) or (_full_data.get('metadata', {}) or {}).get('edges', [])
+                    td_list = cm.get('tables_detail', []) or (_full_data.get('metadata', {}) or {}).get('tables_detail', [])
+                    st.caption("**table_config:**")
+                    st.json(_tc_cfg)
+                    st.caption("**Таблицы и выбранные поля:**")
+                    for _td in td_list:
+                        _sel_names = _td.get('selected_field_names', [])
+                        if not _sel_names:
+                            continue
+                        _t_human = _td.get('human_name') or _td.get('table', '?')
+                        _t_tbl = _td.get('table', '?')
+                        st.markdown(f"- **{_t_human}** (`{_t_tbl}`): {', '.join(_sel_names)}")
+                    st.markdown("---")
                     if _cfg_edges:
                         _root_table = cm.get('fact_table', '')
                         _root_human = cm.get('human_name') or _root_table
@@ -2301,9 +2333,32 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
     _pending = st.session_state.pop('_pending_cfg_load', None)
     if _pending is not None:
         _p_tc = _pending.get('table_config', {})
+        _p_excl = _pending.get('excluded_fields', {})
         for _rk, _rv in _p_tc.items():
             st.session_state[f"gen_en_{_rk}"] = bool(_rv.get('enabled', False))
             st.session_state[f"gen_jt_{_rk}"] = str(_rv.get('join_type', 'INNER JOIN'))
+        # Синхронизируем gen_f_* для полей — чтобы fragment не перезаписывал состояние
+        _rels = st.session_state.gen_relationships_collected or []
+        _rel_by_rk = {r['relationship_key']: r for r in _rels}
+        _fact = st.session_state.gen_fact_table_db
+        _root_key = f"__root__{_fact}"
+        _keys_to_sync = {_root_key} | {r['relationship_key'] for r in _rels}
+        for _excl_key in _keys_to_sync:
+            _excl_set = _p_excl.get(_excl_key, set())
+            _excl_set = set(_excl_set) if isinstance(_excl_set, (list, set)) else set()
+            if _excl_key.startswith('__root__'):
+                _tbl = _excl_key.replace('__root__', '')
+                _cols = _get_table_columns_cached(st.session_state.connection_string, _tbl)
+            else:
+                _rel = _rel_by_rk.get(_excl_key)
+                if not _rel:
+                    continue
+                _dir = _rel.get('direction', 'forward')
+                _tbl = _rel['target_table'] if _dir == 'forward' else _rel['source_table']
+                _cols = _get_table_columns_cached(st.session_state.connection_string, _tbl)
+            for _cname, _, _ in (_cols or []):
+                _fkey = f"gen_f_{_excl_key}_{_cname}"
+                st.session_state[_fkey] = _cname not in _excl_set
 
     _render_config_section()
 
@@ -2328,6 +2383,24 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
             _CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
             ts = datetime.now()
             safe_name = selected_table_db.replace('.', '_').replace(' ', '_').lstrip('_')
+
+            # Принудительная синхронизация excluded_fields из чекбоксов (fragment мог не успеть)
+            _root_key_sync = f"__root__{selected_table_db}"
+            _root_cols = _get_table_columns_cached(st.session_state.connection_string, selected_table_db)
+            if _root_key_sync not in excluded_fields:
+                excluded_fields[_root_key_sync] = set()
+            _new_excl_root = {c[0] for c in (_root_cols or []) if not st.session_state.get(f"gen_f_{_root_key_sync}_{c[0]}", True)}
+            excluded_fields[_root_key_sync] = _new_excl_root
+            for _rel in relationships:
+                _rk = _rel['relationship_key']
+                _dir = _rel.get('direction', 'forward')
+                _tbl = _rel['target_table'] if _dir == 'forward' else _rel['source_table']
+                _cols = _get_table_columns_cached(st.session_state.connection_string, _tbl)
+                if _rk not in excluded_fields:
+                    excluded_fields[_rk] = set()
+                _new_excl = {c[0] for c in (_cols or []) if not st.session_state.get(f"gen_f_{_rk}_{c[0]}", True)}
+                excluded_fields[_rk] = _new_excl
+            st.session_state.gen_excluded_fields = excluded_fields
 
             # Конвертируем excluded_fields sets в lists для JSON
             excl_serializable = {}
@@ -2385,7 +2458,10 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                     if tc.get('enabled'):
                         src = rel['source_table']
                         tgt = rel['target_table']
-                        cols = _get_table_columns_cached(st.session_state.connection_string, tgt)
+                        _dir = rel.get('direction', 'forward')
+                        # Для обратных связей: поля в source (таблица, ссылающаяся на целевую)
+                        show_table = tgt if _dir == 'forward' else src
+                        cols = _get_table_columns_cached(st.session_state.connection_string, show_table)
                         if cols:
                             n = len(cols)
                             excl = len(excluded_fields.get(rk, set()))
@@ -2395,8 +2471,8 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                             _active_tables += 1
                             sel_names = [c[0] for c in cols if c[0] not in excluded_fields.get(rk, set())]
                             _tables_detail.append({
-                                'table': tgt,
-                                'human_name': sp.get_table_human_name(tgt) if sp else None,
+                                'table': show_table,
+                                'human_name': sp.get_table_human_name(show_table) if sp else None,
                                 'role': rel.get('direction', 'forward'),
                                 'relationship_key': rk,
                                 'source_field': rel.get('source_field'),
@@ -2623,14 +2699,42 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                         if rk not in _tc:
                             _tc[rk] = {'enabled': False, 'join_type': 'INNER JOIN'}
                         _tc[rk]['join_type'] = str(st.session_state.get(jk, 'INNER JOIN'))
-                _excl = st.session_state.gen_excluded_fields
+                # Синхронизация excluded_fields из чекбоксов (fragment мог не успеть обновить)
+                _excl = dict(st.session_state.gen_excluded_fields)
+                _root_key_gen = f"__root__{selected_table_db}"
+                _root_cols_gen = _get_table_columns_cached(st.session_state.connection_string, selected_table_db)
+                if _root_key_gen not in _excl:
+                    _excl[_root_key_gen] = set()
+                _excl[_root_key_gen] = {c[0] for c in (_root_cols_gen or []) if not st.session_state.get(f"gen_f_{_root_key_gen}_{c[0]}", True)}
+                for _rel in _rels:
+                    _rk = _rel['relationship_key']
+                    _dir = _rel.get('direction', 'forward')
+                    _tbl = _rel['target_table'] if _dir == 'forward' else _rel['source_table']
+                    _cols = _get_table_columns_cached(st.session_state.connection_string, _tbl)
+                    if _rk not in _excl:
+                        _excl[_rk] = set()
+                    _excl[_rk] = {c[0] for c in (_cols or []) if not st.session_state.get(f"gen_f_{_rk}_{c[0]}", True)}
+                st.session_state.gen_excluded_fields = _excl
+
+                _md = st.session_state.get('gen_graph_max_depth') or st.session_state.get('gen_max_depth', 999)
+                _mdu = st.session_state.get('gen_graph_max_depth_up') or st.session_state.get('gen_max_depth_up', 999)
+                try:
+                    _md = int(_md) if _md is not None else 999
+                except (TypeError, ValueError):
+                    _md = 999
+                try:
+                    _mdu = int(_mdu) if _mdu is not None else 999
+                except (TypeError, ValueError):
+                    _mdu = 999
                 sql = vg.generate_view_from_relationships(
                     fact_table=selected_table_db,
                     relationships=_rels,
                     table_config=_tc,
                     excluded_fields=_excl,
                     output_format=output_format_code,
-                    naming_style=naming_style_code
+                    naming_style=naming_style_code,
+                    max_depth_down=_md,
+                    max_depth_up=_mdu
                 )
 
                 st.session_state.gen_generated_sql = sql

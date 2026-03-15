@@ -13,6 +13,7 @@
 - both: оба варианта в одном файле
 """
 
+import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 from db.structure_analyzer import StructureAnalyzer
@@ -300,7 +301,9 @@ class ViewGenerator:
         excluded_fields: Dict[str, Set[str]],
         view_name: str = None,
         output_format: str = 'view',
-        naming_style: str = 'classic'
+        naming_style: str = 'classic',
+        max_depth_down: int = 999,
+        max_depth_up: int = 999
     ) -> str:
         """
         Генерирует SQL VIEW из предварительно построенного списка связей (relationships).
@@ -315,6 +318,8 @@ class ViewGenerator:
             view_name: Имя представления
             output_format: 'view' | 'select' | 'both'
             naming_style: 'classic' | 'dotted'
+            max_depth_down: Макс. шагов вниз по пути (ограничение DFS)
+            max_depth_up: Макс. шагов вверх по пути (ограничение DFS)
 
         Returns:
             SQL скрипт
@@ -390,6 +395,7 @@ class ViewGenerator:
 
             # Таблицы, до которых нужно дойти: включённые + их родители по пути от корня
             enabled_targets: Set[str] = set()
+            enabled_rks = [rk for rk, cfg in table_config.items() if cfg.get('enabled')]
             for rel in relationships:
                 if table_config.get(rel['relationship_key'], {}).get('enabled', False):
                     direction = rel.get('direction', 'forward')
@@ -397,61 +403,83 @@ class ViewGenerator:
                     enabled_targets.add(joined)
                     enabled_targets.add(rb_norm(joined))
 
-            # Расширяем: добавляем родительские таблицы на путях к enabled_targets
-            parent_of: Dict[str, str] = {}  # child -> parent (любой родитель по какому-то ребру)
+            # Расширяем: добавляем только родителя, который является корнем (путь root -> enabled).
+            # У enabled может быть несколько «родителей» (reverse rels), но путь от root — только один.
+            norm_root = rb_norm(fact_table_db)
+            root_names = {fact_table_db, norm_root}
             for rel in relationships:
+                if not table_config.get(rel['relationship_key'], {}).get('enabled', False):
+                    continue
                 direction = rel.get('direction', 'forward')
-                parent = rel['source_table'] if direction == 'forward' else rel['target_table']
                 child = rel['target_table'] if direction == 'forward' else rel['source_table']
-                for cn in (child, rb_norm(child)):
-                    if cn not in parent_of:
-                        parent_of[cn] = parent
-            changed = True
-            while changed:
-                changed = False
-                for rel in relationships:
-                    direction = rel.get('direction', 'forward')
-                    child = rel['target_table'] if direction == 'forward' else rel['source_table']
-                    cn = rb_norm(child)
-                    if cn in enabled_targets or child in enabled_targets:
-                        parent = rel['source_table'] if direction == 'forward' else rel['target_table']
-                        pn = rb_norm(parent)
-                        if pn not in enabled_targets and parent not in enabled_targets:
-                            enabled_targets.add(pn)
-                            enabled_targets.add(parent)
-                            changed = True
+                parent = rel['source_table'] if direction == 'forward' else rel['target_table']
+                # Для enabled rel добавляем parent только если это корень (путь root -> child)
+                if rb_norm(parent) in root_names or parent in root_names:
+                    enabled_targets.add(norm_root)
+                    enabled_targets.add(fact_table_db)
+                    break
 
             # Транзитные связи: нужны для пути, но не включены пользователем (не добавляем их поля)
             transit_only_rks: Set[str] = set()
 
+            _max_path = max_depth_down + max_depth_up
+
             result, visited = [], set()
 
-            def _dfs(t):
+            def _dfs(t, parent_sd: int, parent_su: int):
+                """parent_sd/parent_su — накопительные шаги вниз/вверх от корня до t."""
                 tn = rb_norm(t)
                 for key in (t, tn):
                     for rel in children.get(key, []):
                         rk = rel['relationship_key']
                         if rk in visited:
                             continue
-                        visited.add(rk)
                         direction = rel.get('direction', 'forward')
+                        if direction == 'forward':
+                            child_sd = parent_sd + 1
+                            child_su = parent_su
+                        else:
+                            child_sd = parent_sd
+                            child_su = parent_su + 1
+                        # Ограничение по длине пути: не обрабатывать и не рекурсировать
+                        if child_sd > max_depth_down or child_su > max_depth_up:
+                            continue
+                        if child_sd + child_su > _max_path:
+                            continue
+                        visited.add(rk)
                         child = rel['target_table'] if direction == 'forward' else rel['source_table']
                         cn = rb_norm(child)
                         is_enabled = table_config.get(rk, {}).get('enabled', False)
                         is_needed = cn in enabled_targets or child in enabled_targets
                         if is_enabled:
                             result.append(rel)
+                            _dfs(child, child_sd, child_su)
                         elif is_needed:
                             result.append(rel)
                             transit_only_rks.add(rk)
-                        _dfs(child)
+                            _dfs(child, child_sd, child_su)
 
-            _dfs(rb_norm(fact_table_db))
+            _dfs(rb_norm(fact_table_db), 0, 0)
             if rb_norm(fact_table_db) != fact_table_db:
-                _dfs(fact_table_db)
+                _dfs(fact_table_db, 0, 0)
+
             return result, transit_only_rks
 
         sorted_rels, transit_only_rks = _build_dfs_order()
+
+        # Валидация: предупреждение при расхождении числа JOIN'ов и включённых связей
+        _enabled_count = sum(1 for cfg in (table_config or {}).values() if cfg.get('enabled'))
+        if _enabled_count > 0 and len(sorted_rels) == 0:
+            logging.warning(
+                f"[ViewGenerator] Включено связей: {_enabled_count}, но sorted_rels пуст. "
+                "Проверьте граф и table_config."
+            )
+        elif _enabled_count > 0 and len(sorted_rels) > _enabled_count * 3:
+            logging.warning(
+                f"[ViewGenerator] Возможное расхождение: включено {_enabled_count} связей, "
+                f"JOIN'ов в sorted_rels: {len(sorted_rels)}. Ожидаемо при транзитных путях, "
+                "но проверьте при аномалиях."
+            )
 
         def _ensure_unique_alias(base_alias: str) -> str:
             """Создаёт уникальный алиас колонки."""
@@ -478,10 +506,9 @@ class ViewGenerator:
                 col_name = col['name']
                 col_type = col['data_type']
                 col_max_length = col.get('max_length')
-                if col_type in ['binary', 'varbinary'] and col_max_length == 16:
-                    continue
                 if col_name in excluded:
                     continue
+                # binary(16): раньше всегда пропускали; теперь включаем при явном выборе (не в excluded)
 
                 human_name = self.structure_parser.get_field_human_name(table_name, col_name) or col_name
                 field_ref = f"[{alias}].[{col_name}]"
@@ -557,12 +584,22 @@ class ViewGenerator:
             if alias_for_join not in joined_aliases:
                 continue
 
-            pk_col = _get_pk_column(new_table)
-            schema, tbl = self.analyzer._parse_table_name(new_table)
-            join_sql = (
-                f"{join_type} [{schema}].[{tbl}] AS [{new_alias}] "
-                f"ON [{alias_for_join}].[{field_name}] = [{new_alias}].[{pk_col}]"
-            )
+            # Для обратных связей: field_name — FK в потомке (new_table), родитель — по PK.
+            # Для прямых: field_name — FK в родителе (existing), потомок — по PK.
+            if direction == 'reverse':
+                parent_pk = _get_pk_column(existing_table)
+                schema, tbl = self.analyzer._parse_table_name(new_table)
+                join_sql = (
+                    f"{join_type} [{schema}].[{tbl}] AS [{new_alias}] "
+                    f"ON [{alias_for_join}].[{parent_pk}] = [{new_alias}].[{field_name}]"
+                )
+            else:
+                pk_col = _get_pk_column(new_table)
+                schema, tbl = self.analyzer._parse_table_name(new_table)
+                join_sql = (
+                    f"{join_type} [{schema}].[{tbl}] AS [{new_alias}] "
+                    f"ON [{alias_for_join}].[{field_name}] = [{new_alias}].[{pk_col}]"
+                )
             self.joins.append(join_sql)
             self.table_aliases[new_table] = new_alias
             joined_aliases.add(new_alias)
@@ -587,7 +624,32 @@ class ViewGenerator:
         if self.joins:
             select_body += "\n".join(self.joins)
 
-        header = self._generate_header(fact_table_db, view_name, len(sorted_rels))
+        # Собираем таблицы и выбранные поля для заголовка (только где выбрано хотя бы одно)
+        def _sel_cols(cols_list, excl_set):
+            """Выбранные поля (не в excl_set); binary(16) включаем при явном выборе."""
+            return [c['name'] for c in cols_list if c['name'] not in excl_set]
+        tables_with_selected: Dict[str, List[str]] = {}
+        root_key = f"__root__{fact_table_db}"
+        root_cols = self.analyzer.get_table_columns(fact_table_db)
+        root_sel = _sel_cols(root_cols, excluded_fields.get(root_key, set()))
+        if root_sel:
+            tables_with_selected[fact_table_db] = root_sel
+        for rel in sorted_rels:
+            rk = rel['relationship_key']
+            if rk in transit_only_rks:
+                continue
+            direction = rel.get('direction', 'forward')
+            tgt = rel['target_table'] if direction == 'forward' else rel['source_table']
+            cols = self.analyzer.get_table_columns(tgt)
+            sel = _sel_cols(cols, excluded_fields.get(rk, set()))
+            if sel:
+                tables_with_selected[tgt] = sel
+
+        header = self._generate_header(
+            fact_table_db, view_name, len(sorted_rels),
+            table_config=table_config,
+            tables_with_selected=tables_with_selected
+        )
         if output_format == 'select':
             return header + select_body
         elif output_format == 'both':
@@ -681,7 +743,14 @@ class ViewGenerator:
         else:  # 'view'
             return header + f"CREATE OR ALTER VIEW [{view_name}] AS\n{select_body}"
     
-    def _generate_header(self, fact_table_db: str, view_name: str, max_depth: int) -> str:
+    def _generate_header(
+        self,
+        fact_table_db: str,
+        view_name: str,
+        max_depth: int,
+        table_config: Optional[Dict] = None,
+        tables_with_selected: Optional[Dict[str, List[str]]] = None
+    ) -> str:
         """Генерирует заголовок с метаданными."""
         human_name = self.structure_parser.get_table_human_name(fact_table_db) or fact_table_db
         lines = [
@@ -692,9 +761,18 @@ class ViewGenerator:
             f"-- Глубина JOIN: {max_depth}",
             f"-- Количество JOIN: {len(self.joins)}",
             f"-- Количество полей: {len(self.selected_fields)}",
+        ]
+        if table_config is not None:
+            lines.append(f"-- table_config: {table_config}")
+        if tables_with_selected is not None and tables_with_selected:
+            lines.append("-- Таблицы и выбранные поля:")
+            for tbl, fields in tables_with_selected.items():
+                t_human = self.structure_parser.get_table_human_name(tbl) or tbl
+                lines.append(f"--   {t_human} ({tbl}): {', '.join(fields)}")
+        lines.extend([
             f"-- {'=' * 60}",
             "",
-        ]
+        ])
         return "\n".join(lines) + "\n"
     
     def _add_table_fields(
