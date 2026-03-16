@@ -2,6 +2,7 @@
 mssql-python>=1.0.0
 python-docx>=1.1.0
 streamlit>=1.33.0
+streamlit-scroll-to-top>=0.0.4
 networkx>=3.0
 matplotlib>=3.5
 

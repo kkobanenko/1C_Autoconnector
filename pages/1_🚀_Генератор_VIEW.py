@@ -5,6 +5,7 @@
 """
 
 import streamlit as st
+from streamlit_scroll_to_top import scroll_to_here
 import json
 import traceback
 from pathlib import Path
@@ -1403,6 +1404,14 @@ def _render_config_section():
             del st.session_state['gen_jump_target_page']
         st.rerun()
 
+    # Навигация по binary(16): _nav_scroll_to_rk — куда прокрутить; _nav_back_to_rk — откуда пришли (для «Назад»)
+    if '_nav_scroll_to_rk' not in st.session_state:
+        st.session_state._nav_scroll_to_rk = None
+    if '_nav_back_to_rk' not in st.session_state:
+        st.session_state._nav_back_to_rk = None
+    if '_nav_arrived_at_rk' not in st.session_state:
+        st.session_state._nav_arrived_at_rk = None
+
     relationships = st.session_state.gen_relationships_collected
     table_config = dict(st.session_state.gen_table_config)
     excluded_fields = st.session_state.gen_excluded_fields
@@ -1620,6 +1629,20 @@ def _render_config_section():
     # Словарь rk → rel для быстрого поиска связи по ключу (нужен для отображения пути)
     _rk_to_rel = {r['relationship_key']: r for r in relationships}
 
+    # Маппинг (show_table, field_name) -> target_rk для binary(16) полей с связью в графе
+    _field_to_target = {}
+    for rel in relationships:
+        rk = rel['relationship_key']
+        direction = rel.get('direction', 'forward')
+        if direction == 'forward':
+            show_t = rel['source_table']
+        else:
+            show_t = rel['target_table']
+        fn = rel['field_name']
+        _field_to_target[(show_t, fn)] = rk
+
+    _root_key = f"__root__{selected_table_db}"
+
     def _sync_excluded_for_rel(rel):
         """Синхронизирует excluded_fields из session_state для данной связи. Возвращает (n_included, n_total, cols)."""
         rk = rel['relationship_key']
@@ -1684,6 +1707,12 @@ def _render_config_section():
         indent = max(0.2, 0.3 * (2 + tree_indent))
         _cols = st.columns([indent, 10 - indent])
         with _cols[1]:
+            # Прокрутка к узлу при навигации по binary(16)
+            if st.session_state.get('_nav_scroll_to_rk') == rk:
+                scroll_to_here(0, key=f"scroll_{rk}")
+                st.session_state._nav_scroll_to_rk = None
+                st.session_state._nav_arrived_at_rk = rk
+
             if not is_expanded:
                 # Свёрнутый узел: заголовок + кнопка развернуть
                 table_config[rk] = {'enabled': enabled, 'join_type': cfg.get('join_type', _DEFAULT_JOIN)}
@@ -1697,12 +1726,43 @@ def _render_config_section():
                         st.rerun()
             else:
                 # Развёрнутый узел: кнопка свернуть, link, join_type, поля
-                row1, row2 = st.columns([4, 1])
-                with row2:
-                    if st.button("▲ Свернуть", key=f"collapse_{rk}"):
-                        _expanded_nodes.discard(rk)
-                        st.session_state['_config_expanded_nodes'] = _expanded_nodes
-                        st.rerun()
+                show_back = st.session_state.get('_nav_arrived_at_rk') == rk
+                if show_back:
+                    back_rel = _rk_to_rel.get(st.session_state.get('_nav_back_to_rk'))
+                    if back_rel:
+                        direction_b = back_rel.get('direction', 'forward')
+                        back_show = back_rel['source_table'] if direction_b == 'reverse' else back_rel['target_table']
+                        back_human = sp.get_table_human_name(back_show) if sp else None
+                        back_label = f"{back_human} ({back_show})" if back_human else back_show
+                    elif st.session_state.get('_nav_back_to_rk') == _root_key:
+                        back_human = sp.get_table_human_name(selected_table_db) if sp else None
+                        back_label = f"{back_human} ({selected_table_db})" if back_human else selected_table_db
+                    else:
+                        back_label = "источник"
+                    row1, row2, row3 = st.columns([3, 1, 1])
+                    with row2:
+                        if st.button(f"← Назад к {back_label}", key=f"nav_back_{rk}"):
+                            _back_rk = st.session_state._nav_back_to_rk
+                            _expanded_nodes.add(_back_rk)
+                            st.session_state['_config_expanded_nodes'] = _expanded_nodes
+                            st.session_state._nav_scroll_to_rk = _back_rk
+                            st.session_state._nav_back_to_rk = None
+                            st.session_state._nav_arrived_at_rk = None
+                            st.rerun()
+                    with row3:
+                        if st.button("▲ Свернуть", key=f"collapse_{rk}"):
+                            _expanded_nodes.discard(rk)
+                            st.session_state['_config_expanded_nodes'] = _expanded_nodes
+                            st.session_state._nav_arrived_at_rk = None
+                            st.session_state._nav_back_to_rk = None
+                            st.rerun()
+                else:
+                    row1, row2 = st.columns([4, 1])
+                    with row2:
+                        if st.button("▲ Свернуть", key=f"collapse_{rk}"):
+                            _expanded_nodes.discard(rk)
+                            st.session_state['_config_expanded_nodes'] = _expanded_nodes
+                            st.rerun()
                 with row1:
                     st.markdown(header)
 
@@ -1782,7 +1842,27 @@ def _render_config_section():
                             target_col = col_left if vis_idx % 2 == 0 else col_right
                             with target_col:
                                 is_included = cname not in excluded_fields.get(excl_key, set())
-                                st.checkbox(c_label, value=is_included, key=f"gen_f_{rk}_{cname}")
+                                target_rk = _field_to_target.get((tgt, cname)) if cat == 'ref16' else None
+                                if cat == 'ref16':
+                                    cb_col, btn_col = st.columns([4, 1])
+                                    with cb_col:
+                                        st.checkbox(c_label, value=is_included, key=f"gen_f_{rk}_{cname}")
+                                    with btn_col:
+                                        if target_rk:
+                                            trg_rel = _rk_to_rel.get(target_rk)
+                                            trg_t = trg_rel['target_table'] if trg_rel and trg_rel.get('direction') == 'forward' else (trg_rel['source_table'] if trg_rel else '')
+                                            trg_h = sp.get_table_human_name(trg_t) if sp and trg_t else ''
+                                            tip = f"Перейти к настройке таблицы {trg_h or trg_t}"
+                                            if st.button("→", key=f"nav_to_{rk}_{cname}", help=tip):
+                                                _expanded_nodes.add(target_rk)
+                                                st.session_state['_config_expanded_nodes'] = _expanded_nodes
+                                                st.session_state._nav_back_to_rk = rk
+                                                st.session_state._nav_scroll_to_rk = target_rk
+                                                st.rerun()
+                                        else:
+                                            st.button("→", key=f"nav_to_{rk}_{cname}", disabled=True, help="Нет связи в графе")
+                                else:
+                                    st.checkbox(c_label, value=is_included, key=f"gen_f_{rk}_{cname}")
                             vis_idx += 1
                         st.markdown("---")
 
@@ -1816,6 +1896,31 @@ def _render_config_section():
     root_header = f"⭐ Корневая таблица: {root_display} — полей: {n_included_root}/{n_total_root}"
     with st.expander(root_header, expanded=True):
         if root_cols:
+            # Прокрутка к корню при навигации «Назад»
+            if st.session_state.get('_nav_scroll_to_rk') == _root_key:
+                scroll_to_here(0, key=f"scroll_{_root_key}")
+                st.session_state._nav_scroll_to_rk = None
+                st.session_state._nav_arrived_at_rk = _root_key
+
+            # Кнопка «← Назад» при возврате из связанной таблицы
+            if st.session_state.get('_nav_arrived_at_rk') == _root_key:
+                back_rk = st.session_state.get('_nav_back_to_rk')
+                back_rel = _rk_to_rel.get(back_rk) if back_rk else None
+                if back_rel:
+                    direction_b = back_rel.get('direction', 'forward')
+                    back_show = back_rel['source_table'] if direction_b == 'reverse' else back_rel['target_table']
+                    back_human = sp.get_table_human_name(back_show) if sp else None
+                    back_label = f"{back_human} ({back_show})" if back_human else back_show
+                else:
+                    back_label = "источник"
+                if st.button(f"← Назад к {back_label}", key=f"nav_back_{_root_key}"):
+                    _expanded_nodes = set(st.session_state.get('_config_expanded_nodes', set()))
+                    _expanded_nodes.add(back_rk)
+                    st.session_state['_config_expanded_nodes'] = _expanded_nodes
+                    st.session_state._nav_scroll_to_rk = back_rk
+                    st.session_state._nav_back_to_rk = None
+                    st.session_state._nav_arrived_at_rk = None
+                    st.rerun()
             panel_key_root = f"_panel_{_root_key}"
             if panel_key_root not in st.session_state:
                 st.session_state[panel_key_root] = False
@@ -1866,7 +1971,28 @@ def _render_config_section():
                     target_col = col_left if vis_idx % 2 == 0 else col_right
                     with target_col:
                         is_included = cname not in excluded_fields[_root_key]
-                        st.checkbox(c_label, value=is_included, key=f"gen_f_{_root_key}_{cname}")
+                        target_rk = _field_to_target.get((selected_table_db, cname)) if cat == 'ref16' else None
+                        if cat == 'ref16':
+                            cb_col, btn_col = st.columns([4, 1])
+                            with cb_col:
+                                st.checkbox(c_label, value=is_included, key=f"gen_f_{_root_key}_{cname}")
+                            with btn_col:
+                                if target_rk:
+                                    trg_rel = _rk_to_rel.get(target_rk)
+                                    trg_t = trg_rel['target_table'] if trg_rel and trg_rel.get('direction') == 'forward' else (trg_rel['source_table'] if trg_rel else '')
+                                    trg_h = sp.get_table_human_name(trg_t) if sp and trg_t else ''
+                                    tip = f"Перейти к настройке таблицы {trg_h or trg_t}"
+                                    if st.button("→", key=f"nav_to_{_root_key}_{cname}", help=tip):
+                                        _expanded_nodes = set(st.session_state.get('_config_expanded_nodes', set()))
+                                        _expanded_nodes.add(target_rk)
+                                        st.session_state['_config_expanded_nodes'] = _expanded_nodes
+                                        st.session_state._nav_back_to_rk = _root_key
+                                        st.session_state._nav_scroll_to_rk = target_rk
+                                        st.rerun()
+                                else:
+                                    st.button("→", key=f"nav_to_{_root_key}_{cname}", disabled=True, help="Нет связи в графе")
+                        else:
+                            st.checkbox(c_label, value=is_included, key=f"gen_f_{_root_key}_{cname}")
                     vis_idx += 1
                 st.markdown("---")
         else:
@@ -1997,6 +2123,11 @@ def _render_config_section():
     n_pages = max(1, (n_total + REL_PER_PAGE - 1) // REL_PER_PAGE)
     if 'gen_rels_page' not in st.session_state:
         st.session_state.gen_rels_page = 0
+    # При навигации по binary(16) переключаем страницу на целевой узел
+    _nav_rk = st.session_state.get('_nav_scroll_to_rk')
+    if _nav_rk and _nav_rk != _root_key and _rels_to_show:
+        _target_idx = next((i for i, r in enumerate(_rels_to_show) if r['relationship_key'] == _nav_rk), 0)
+        st.session_state.gen_rels_page = min(_target_idx // REL_PER_PAGE, n_pages - 1)
     page = max(0, min(st.session_state.gen_rels_page, n_pages - 1))
     st.session_state.gen_rels_page = page
 
@@ -2244,11 +2375,8 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                             _full_data = json.load(_f)
                     except Exception:
                         pass
-                    _tc_cfg = _full_data.get('table_config', cm.get('table_config', {}))
                     _cfg_edges = cm.get('edges', []) or (_full_data.get('metadata', {}) or {}).get('edges', [])
                     td_list = cm.get('tables_detail', []) or (_full_data.get('metadata', {}) or {}).get('tables_detail', [])
-                    st.caption("**table_config:**")
-                    st.json(_tc_cfg)
                     st.caption("**Таблицы и выбранные поля:**")
                     for _td in td_list:
                         _sel_names = _td.get('selected_field_names', [])

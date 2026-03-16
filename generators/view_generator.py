@@ -647,7 +647,6 @@ class ViewGenerator:
 
         header = self._generate_header(
             fact_table_db, view_name, len(sorted_rels),
-            table_config=table_config,
             tables_with_selected=tables_with_selected
         )
         if output_format == 'select':
@@ -748,7 +747,6 @@ class ViewGenerator:
         fact_table_db: str,
         view_name: str,
         max_depth: int,
-        table_config: Optional[Dict] = None,
         tables_with_selected: Optional[Dict[str, List[str]]] = None
     ) -> str:
         """Генерирует заголовок с метаданными."""
@@ -762,8 +760,6 @@ class ViewGenerator:
             f"-- Количество JOIN: {len(self.joins)}",
             f"-- Количество полей: {len(self.selected_fields)}",
         ]
-        if table_config is not None:
-            lines.append(f"-- table_config: {table_config}")
         if tables_with_selected is not None and tables_with_selected:
             lines.append("-- Таблицы и выбранные поля:")
             for tbl, fields in tables_with_selected.items():
