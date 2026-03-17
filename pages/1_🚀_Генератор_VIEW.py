@@ -1626,6 +1626,9 @@ def _render_config_section():
     (_sorted_rels, _rel_key_to_indent, _rel_key_to_level, _rel_key_to_path_length,
      _rel_key_to_path, _rel_key_to_cumulative_sd, _rel_key_to_cumulative_su) = _build_dfs_order()
 
+    # Сохраняем для кнопки «Сохранить» и генерации SQL (path_from_root)
+    st.session_state.gen_rel_key_to_path = _rel_key_to_path
+
     # Словарь rk → rel для быстрого поиска связи по ключу (нужен для отображения пути)
     _rk_to_rel = {r['relationship_key']: r for r in relationships}
 
@@ -2341,18 +2344,27 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                     if st.button(f"📌 {label}", key=f"pre_cfg_load_{i}", use_container_width=True):
                         with open(cm['filepath'], 'r', encoding='utf-8') as f:
                             full_data = json.load(f)
-                        loaded_tc = full_data.get('table_config', {})
-                        loaded_excl = full_data.get('excluded_fields', {})
-                        restored_excl = {}
-                        for k, v in loaded_excl.items():
-                            restored_excl[k] = set(v) if isinstance(v, list) else v
-                        st.session_state._pending_cfg_load = {
-                            'table_config': loaded_tc,
-                            'excluded_fields': restored_excl,
-                        }
-                        st.session_state.gen_table_config = loaded_tc
-                        st.session_state.gen_excluded_fields = restored_excl
-                        st.success(f"✅ Конфигурация загружена: {cm.get('active_tables', '?')} таблиц, {sel_f} полей")
+                        td_list_load = full_data.get('metadata', {}).get('tables_detail', [])
+                        # Проверка path_from_root: у всех таблиц кроме root должен быть путь
+                        _missing_path = [t.get('table', '?') for t in td_list_load if t.get('role') != 'root' and 'path_from_root' not in t]
+                        if _missing_path:
+                            st.error(
+                                f"⚠️ Конфигурация устарела: отсутствует path_from_root у таблиц {_missing_path[:5]}{'...' if len(_missing_path) > 5 else ''}. "
+                                "Удалите старые конфигурации и сохраните заново."
+                            )
+                        else:
+                            loaded_tc = full_data.get('table_config', {})
+                            loaded_excl = full_data.get('excluded_fields', {})
+                            restored_excl = {}
+                            for k, v in loaded_excl.items():
+                                restored_excl[k] = set(v) if isinstance(v, list) else v
+                            st.session_state._pending_cfg_load = {
+                                'table_config': loaded_tc,
+                                'excluded_fields': restored_excl,
+                            }
+                            st.session_state.gen_table_config = loaded_tc
+                            st.session_state.gen_excluded_fields = restored_excl
+                            st.success(f"✅ Конфигурация загружена: {cm.get('active_tables', '?')} таблиц, {sel_f} полей")
                         st.rerun()
                 with col_info:
                     detail_key = f"_pre_cfg_detail_{i}"
@@ -2550,13 +2562,17 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                         continue
 
             if not _is_duplicate:
+                _rel_key_to_path_save = st.session_state.get('gen_rel_key_to_path') or {}
+                _rk_to_rel_save = {r['relationship_key']: r for r in relationships}
+
                 filename = f"cfg_{safe_name}_{ts.strftime('%Y%m%d_%H%M%S')}.json"
 
-                # Собираем детали по каждой таблице, включая корневую
+                # Собираем детали по каждой таблице, включая корневую и транзитные
                 _total_fields = 0
                 _selected_fields = 0
                 _active_tables = 0
                 _tables_detail = []
+                _tables_seen = set()  # чтобы не дублировать транзитные
 
                 # 1) Корневая таблица
                 _root_key_save = f"__root__{selected_table_db}"
@@ -2577,52 +2593,118 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                         'selected_fields': sel_root,
                         'selected_field_names': root_selected_names,
                     })
+                    _tables_seen.add(selected_table_db)
 
-                # 2) Связанные таблицы + рёбра графа
+                # 2) Связанные таблицы: path_from_root, транзитные, рёбра из путей
                 _edges = []
+                _edges_rk_seen = set()
                 for rel in relationships:
                     rk = rel['relationship_key']
                     tc = table_config.get(rk, {})
-                    if tc.get('enabled'):
-                        src = rel['source_table']
-                        tgt = rel['target_table']
-                        _dir = rel.get('direction', 'forward')
-                        # Для обратных связей: поля в source (таблица, ссылающаяся на целевую)
-                        show_table = tgt if _dir == 'forward' else src
-                        cols = _get_table_columns_cached(st.session_state.connection_string, show_table)
-                        if cols:
-                            n = len(cols)
-                            excl = len(excluded_fields.get(rk, set()))
-                            sel = n - excl
-                            _total_fields += n
-                            _selected_fields += sel
+                    if not tc.get('enabled'):
+                        continue
+                    path_from_root = _rel_key_to_path_save.get(rk, [rk])
+                    src = rel['source_table']
+                    tgt = rel['target_table']
+                    _dir = rel.get('direction', 'forward')
+                    show_table = tgt if _dir == 'forward' else src
+                    cols = _get_table_columns_cached(st.session_state.connection_string, show_table)
+                    if not cols:
+                        continue
+                    n = len(cols)
+                    excl = len(excluded_fields.get(rk, set()))
+                    sel = n - excl
+                    sel_names = [c[0] for c in cols if c[0] not in excluded_fields.get(rk, set())]
+
+                    # Транзитные таблицы: все rk в path кроме последнего
+                    for transit_rk in path_from_root[:-1]:
+                        transit_rel = _rk_to_rel_save.get(transit_rk)
+                        if not transit_rel:
+                            continue
+                        td = transit_rel.get('direction', 'forward')
+                        transit_show = transit_rel['target_table'] if td == 'forward' else transit_rel['source_table']
+                        if transit_show not in _tables_seen:
+                            _tables_seen.add(transit_show)
+                            transit_cols = _get_table_columns_cached(st.session_state.connection_string, transit_show)
+                            n_transit = len(transit_cols) if transit_cols else 0
+                            _total_fields += n_transit
                             _active_tables += 1
-                            sel_names = [c[0] for c in cols if c[0] not in excluded_fields.get(rk, set())]
                             _tables_detail.append({
-                                'table': show_table,
-                                'human_name': sp.get_table_human_name(show_table) if sp else None,
-                                'role': rel.get('direction', 'forward'),
-                                'relationship_key': rk,
-                                'source_field': rel.get('source_field'),
-                                'depth': rel.get('depth', 0),
-                                'join_type': tc.get('join_type', 'INNER JOIN'),
-                                'total_fields': n,
-                                'selected_fields': sel,
-                                'selected_field_names': sel_names,
+                                'table': transit_show,
+                                'human_name': sp.get_table_human_name(transit_show) if sp else None,
+                                'role': transit_rel.get('direction', 'forward'),
+                                'relationship_key': transit_rk,
+                                'source_field': transit_rel.get('source_field'),
+                                'depth': transit_rel.get('depth', 0),
+                                'join_type': table_config.get(transit_rk, {}).get('join_type', 'INNER JOIN'),
+                                'total_fields': n_transit,
+                                'selected_fields': 0,
+                                'selected_field_names': [],
+                                'path_from_root': _rel_key_to_path_save.get(transit_rk, [transit_rk]),
                             })
-                            _edges.append({
-                                'source': src,
-                                'source_human': sp.get_table_human_name(src) if sp else None,
-                                'target': tgt,
-                                'target_human': sp.get_table_human_name(tgt) if sp else None,
-                                'field_name': rel.get('field_name'),
-                                'join_type': tc.get('join_type', 'INNER JOIN'),
-                                'direction': rel.get('direction', 'forward'),
-                                'depth': rel.get('depth', 0),
-                                'relationship_key': rk,
-                                'selected_fields': sel,
-                                'total_fields': n,
-                            })
+                            # Ребро для транзитной связи
+                            if transit_rk not in _edges_rk_seen:
+                                _edges_rk_seen.add(transit_rk)
+                                tsrc = transit_rel['source_table']
+                                ttgt = transit_rel['target_table']
+                                _edges.append({
+                                    'source': tsrc,
+                                    'source_human': sp.get_table_human_name(tsrc) if sp else None,
+                                    'target': ttgt,
+                                    'target_human': sp.get_table_human_name(ttgt) if sp else None,
+                                    'field_name': transit_rel.get('field_name'),
+                                    'join_type': table_config.get(transit_rk, {}).get('join_type', 'INNER JOIN'),
+                                    'direction': transit_rel.get('direction', 'forward'),
+                                    'depth': transit_rel.get('depth', 0),
+                                    'relationship_key': transit_rk,
+                                    'selected_fields': 0,
+                                    'total_fields': n_transit,
+                                })
+
+                    _total_fields += n
+                    _selected_fields += sel
+                    _active_tables += 1
+                    _tables_detail.append({
+                        'table': show_table,
+                        'human_name': sp.get_table_human_name(show_table) if sp else None,
+                        'role': rel.get('direction', 'forward'),
+                        'relationship_key': rk,
+                        'source_field': rel.get('source_field'),
+                        'depth': rel.get('depth', 0),
+                        'join_type': tc.get('join_type', 'INNER JOIN'),
+                        'total_fields': n,
+                        'selected_fields': sel,
+                        'selected_field_names': sel_names,
+                        'path_from_root': path_from_root,
+                    })
+                    # Рёбра из path_from_root (все рёбра пути)
+                    for edge_rk in path_from_root:
+                        if edge_rk in _edges_rk_seen:
+                            continue
+                        edge_rel = _rk_to_rel_save.get(edge_rk)
+                        if not edge_rel:
+                            continue
+                        _edges_rk_seen.add(edge_rk)
+                        esrc = edge_rel['source_table']
+                        etgt = edge_rel['target_table']
+                        edir = edge_rel.get('direction', 'forward')
+                        eshow = etgt if edir == 'forward' else esrc
+                        ecols = _get_table_columns_cached(st.session_state.connection_string, eshow)
+                        en = len(ecols) if ecols else 0
+                        esel = en - len(excluded_fields.get(edge_rk, set()))
+                        _edges.append({
+                            'source': esrc,
+                            'source_human': sp.get_table_human_name(esrc) if sp else None,
+                            'target': etgt,
+                            'target_human': sp.get_table_human_name(etgt) if sp else None,
+                            'field_name': edge_rel.get('field_name'),
+                            'join_type': table_config.get(edge_rk, {}).get('join_type', 'INNER JOIN'),
+                            'direction': edir,
+                            'depth': edge_rel.get('depth', 0),
+                            'relationship_key': edge_rk,
+                            'selected_fields': esel,
+                            'total_fields': en,
+                        })
 
                 config_data = {
                     'metadata': {
@@ -2854,6 +2936,7 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                     _mdu = int(_mdu) if _mdu is not None else 999
                 except (TypeError, ValueError):
                     _mdu = 999
+                _paths = st.session_state.get('gen_rel_key_to_path') or {}
                 sql = vg.generate_view_from_relationships(
                     fact_table=selected_table_db,
                     relationships=_rels,
@@ -2862,7 +2945,8 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                     output_format=output_format_code,
                     naming_style=naming_style_code,
                     max_depth_down=_md,
-                    max_depth_up=_mdu
+                    max_depth_up=_mdu,
+                    paths_from_root=_paths if _paths else None
                 )
 
                 st.session_state.gen_generated_sql = sql

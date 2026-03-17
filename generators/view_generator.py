@@ -303,7 +303,8 @@ class ViewGenerator:
         output_format: str = 'view',
         naming_style: str = 'classic',
         max_depth_down: int = 999,
-        max_depth_up: int = 999
+        max_depth_up: int = 999,
+        paths_from_root: Optional[Dict[str, List[str]]] = None
     ) -> str:
         """
         Генерирует SQL VIEW из предварительно построенного списка связей (relationships).
@@ -320,6 +321,8 @@ class ViewGenerator:
             naming_style: 'classic' | 'dotted'
             max_depth_down: Макс. шагов вниз по пути (ограничение DFS)
             max_depth_up: Макс. шагов вверх по пути (ограничение DFS)
+            paths_from_root: {relationship_key: [rk1, rk2, ...]} — путь от корня до узла (из UI).
+                Если задан, sorted_rels строится из этих путей вместо DFS.
 
         Returns:
             SQL скрипт
@@ -465,7 +468,21 @@ class ViewGenerator:
 
             return result, transit_only_rks
 
-        sorted_rels, transit_only_rks = _build_dfs_order()
+        rk_to_rel = {r['relationship_key']: r for r in relationships}
+        if paths_from_root:
+            # Строим sorted_rels из путей UI (порядок первого вхождения)
+            sorted_rks = []
+            enabled_rks = [rk for rk, cfg in (table_config or {}).items() if cfg.get('enabled')]
+            for rk in enabled_rks:
+                path = paths_from_root.get(rk, [rk])
+                for p in path:
+                    if p not in sorted_rks:
+                        sorted_rks.append(p)
+            sorted_rels = [rk_to_rel[rk] for rk in sorted_rks if rk in rk_to_rel]
+            transit_only_rks = {rk for rk in sorted_rks if rk in rk_to_rel and rk not in enabled_rks}
+        else:
+            sorted_rels, transit_only_rks = _build_dfs_order()
+            transit_only_rks = set(transit_only_rks) if transit_only_rks else set()
 
         # Валидация: предупреждение при расхождении числа JOIN'ов и включённых связей
         _enabled_count = sum(1 for cfg in (table_config or {}).values() if cfg.get('enabled'))
