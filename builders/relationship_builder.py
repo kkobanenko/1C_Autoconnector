@@ -21,10 +21,10 @@ class RelationshipBuilder:
             analyzer: Экземпляр StructureAnalyzer для работы с БД
         """
         self.analyzer = analyzer
-        self.relationship_graph: Dict[str, Dict[str, str]] = {}  # {table: {field: target_table}}
+        self.relationship_graph: Dict[str, Dict[str, List[str]]] = {}  # {table: {field: [target_table, ...]}}
         self._guid_index: Optional[Dict[bytes, str]] = None  # Кэш индекса GUID -> таблица
     
-    def build_relationship_graph(self, table_names: Optional[List[str]] = None) -> Dict[str, Dict[str, str]]:
+    def build_relationship_graph(self, table_names: Optional[List[str]] = None) -> Dict[str, Dict[str, List[str]]]:
         """
         Строит граф связей между таблицами.
         
@@ -32,7 +32,7 @@ class RelationshipBuilder:
             table_names: Список таблиц для анализа. Если None, анализируются все таблицы.
             
         Returns:
-            Граф связей: {table_name: {field_name: target_table_name}}
+            Граф связей: {table_name: {field_name: [target_table, ...]}}
         """
         self.relationship_graph = {}
         
@@ -43,7 +43,7 @@ class RelationshipBuilder:
             print(f"GUID-индекс уже закэширован: {len(self._guid_index)} записей")
         else:
             print("Построение индекса GUID для определения связей...")
-            self._guid_index = self.analyzer.build_guid_index(limit_per_table=100)
+            self._guid_index = self.analyzer.build_guid_index()
         
         # Если таблицы не указаны, получаем все таблицы из БД
         if table_names is None:
@@ -78,166 +78,110 @@ class RelationshipBuilder:
             if normalized not in self.relationship_graph:
                 self.relationship_graph[normalized] = {}
             
-            # Для каждого binary(16) поля пытаемся найти целевую таблицу
+            # Для каждого binary(16) поля пытаемся найти целевые таблицы
             for field_name in binary16_fields:
-                target_table = self._find_target_table(normalized, field_name)
-                if target_table:
-                    # Сохраняем только реальные имена полей (из binary16_fields).
-                    # Не добавляем field_key_no_rref: итерация по графу использует ключи как имена полей,
-                    # и добавление варианта без RRef (напр. _Document653_I из _Document653_IDRRef) создаёт
-                    # связи по несуществующим полям.
-                    self.relationship_graph[normalized][field_name] = target_table
+                target_tables = self._find_target_table(normalized, field_name)
+                if target_tables:
+                    self.relationship_graph[normalized][field_name] = target_tables
         
         return self.relationship_graph
     
-    def _find_target_table(self, table_name: str, field_name: str) -> Optional[str]:
+    def _find_target_table(self, table_name: str, field_name: str) -> List[str]:
         """
-        Находит целевую таблицу для поля binary(16).
+        Находит целевые таблицы для поля binary(16).
         
         Приоритет:
         1. Внешние ключи из sys.foreign_keys
-        2. Эвристика: поле обычно ссылается на таблицу, где ID является PK
+        2. Эвристика по GUID (все найденные цели, отсортированы по частоте)
         
-        Args:
-            table_name: Имя таблицы
-            field_name: Имя поля (может быть с подчеркиванием или без)
-            
         Returns:
-            Имя целевой таблицы или None если не найдено
+            Список целевых таблиц (пустой если не найдено)
         """
         # Метод 1: Проверяем внешние ключи
         foreign_keys = self.analyzer.get_foreign_keys(table_name)
         
-        # Пробуем найти точное совпадение
         for fk in foreign_keys:
             if fk['column_name'] == field_name:
                 ref_table = fk['referenced_table']
-                normalized_ref = self._normalize_table_name(ref_table)
-                return normalized_ref
-        
-        # Пробуем найти без подчеркивания в начале поля
+                return [self._normalize_table_name(ref_table)]
         if field_name.startswith('_'):
             field_name_clean = field_name.lstrip('_')
             for fk in foreign_keys:
                 if fk['column_name'] == field_name_clean or fk['column_name'] == field_name:
-                    ref_table = fk['referenced_table']
-                    normalized_ref = self._normalize_table_name(ref_table)
-                    return normalized_ref
-        
-        # Пробуем найти с подчеркиванием в начале поля
+                    return [self._normalize_table_name(fk['referenced_table'])]
         if not field_name.startswith('_'):
             field_name_with_underscore = '_' + field_name
             for fk in foreign_keys:
                 if fk['column_name'] == field_name_with_underscore or fk['column_name'] == field_name:
-                    ref_table = fk['referenced_table']
-                    normalized_ref = self._normalize_table_name(ref_table)
-                    return normalized_ref
-        
-        # Метод 2: Эвристика для 1С
-        # В 1С поля binary(16) с суффиксом RRef обычно ссылаются на Reference таблицы
-        # Если внешних ключей нет, используем эвристику на основе доступных таблиц
-        
-        # Получаем список всех таблиц в БД
-        all_tables = self.analyzer.get_all_tables()
-        
-        # В 1С поля RRef обычно ссылаются на Reference таблицы
-        # Для начала попробуем найти любую Reference таблицу
-        # В реальности нужно использовать поля TYPE и RTRef для точного определения
-        # Но для простоты используем эвристику: если поле заканчивается на RRef и не является ID,
-        # то это ссылка на Reference таблицу
+                    return [self._normalize_table_name(fk['referenced_table'])]
         
         field_clean = field_name.lstrip('_')
-        
-        # Пропускаем системные поля (ID, Version и т.д.)
         if field_clean in ['IDRRef', 'ID', 'Version', 'Marked']:
-            return None
+            return []
         
-        # Метод 3: Эвристика по GUID - находим первое ненулевое значение поля
-        # и ищем таблицу, в первичном ключе которой есть такое значение
-        # Обрабатываем все поля binary(16), которые заканчиваются на RRef или RRRef
-        # (в 1С могут быть варианты: RRef, RRRef, _RRef, _RRRef и т.д.)
-        # Также пробуем для всех остальных полей binary(16), которые не являются системными
-        target_table = self._find_target_table_by_guid(table_name, field_name)
-        if target_table:
-            return target_table
-        
-        return None
+        return self._find_target_table_by_guid(table_name, field_name)
     
-    def _find_target_table_by_guid(self, table_name: str, field_name: str) -> Optional[str]:
+    def _find_target_table_by_guid(self, table_name: str, field_name: str) -> List[str]:
         """
-        Находит целевую таблицу для поля binary(16) используя эвристику по GUID.
-        Берет первое ненулевое значение поля и ищет таблицу, в PK которой есть такое значение.
+        Находит целевые таблицы для поля binary(16) по GUID.
+        Собирает все цели с подсчётом частоты, сортирует по убыванию.
         
-        Args:
-            table_name: Имя таблицы
-            field_name: Имя поля binary(16)
-            
         Returns:
-            Имя целевой таблицы или None если не найдено
+            Список целевых таблиц (отсортирован по частоте)
         """
         try:
-            # Строим индекс GUID -> таблица если еще не построен
             if self._guid_index is None:
-                self._guid_index = self.analyzer.build_guid_index(limit_per_table=100)
+                self._guid_index = self.analyzer.build_guid_index()
             
-            # Получаем первое ненулевое значение GUID из поля
             normalized = self._normalize_table_name(table_name)
             schema, table = self.analyzer._parse_table_name(normalized)
             
             self.analyzer.connect()
             cursor = self.analyzer.conn.cursor()
             
-            # Ищем первое ненулевое значение
             query = f"""
-                SELECT TOP 1 [{field_name}]
+                SELECT DISTINCT TOP 50000 [{field_name}]
                 FROM [{schema}].[{table}]
                 WHERE [{field_name}] IS NOT NULL
                 AND [{field_name}] != 0x00000000000000000000000000000000
             """
             
             cursor.execute(query)
-            row = cursor.fetchone()
+            rows = cursor.fetchall()
             cursor.close()
             
-            if not row or not row[0]:
-                return None
-            
-            guid_value = row[0]
-            if not guid_value:
-                return None
-            
-            # Преобразуем в bytes (может быть bytearray или bytes)
-            if isinstance(guid_value, bytearray):
-                guid_bytes = bytes(guid_value)
-            elif isinstance(guid_value, bytes):
-                guid_bytes = guid_value
-            else:
-                # Пробуем преобразовать через memoryview
-                try:
+            targets: Dict[str, int] = {}
+            for row in rows:
+                if not row or not row[0]:
+                    continue
+                guid_value = row[0]
+                if not guid_value:
+                    continue
+                if isinstance(guid_value, bytearray):
                     guid_bytes = bytes(guid_value)
-                except:
-                    return None
+                elif isinstance(guid_value, bytes):
+                    guid_bytes = guid_value
+                else:
+                    try:
+                        guid_bytes = bytes(guid_value)
+                    except Exception:
+                        continue
+                if len(guid_bytes) != 16:
+                    continue
+                target_table = self.analyzer.find_table_by_guid(guid_bytes, self._guid_index)
+                if target_table:
+                    nt = self._normalize_table_name(target_table)
+                    targets[nt] = targets.get(nt, 0) + 1
             
-            if len(guid_bytes) != 16:
-                return None
+            return sorted(targets.keys(), key=lambda t: targets[t], reverse=True)
             
-            # Ищем таблицу по GUID в индексе
-            target_table = self.analyzer.find_table_by_guid(guid_bytes, self._guid_index)
-            
-            if target_table:
-                normalized_target = self._normalize_table_name(target_table)
-                return normalized_target
-            
-            return None
-            
-        except Exception as e:
-            # В случае ошибки возвращаем None
-            return None
+        except Exception:
+            return []
     
-    def get_related_tables(self, table_name: str) -> Dict[str, str]:
+    def get_related_tables(self, table_name: str) -> Dict[str, List[str]]:
         """
         Получает список связанных таблиц для заданной таблицы.
-        Если таблицы нет в графе связей, динамически строит связи через GUID индекс.
+        Приоритет: 1) relationship_graph, 2) analyzer._relationship_index, 3) _find_target_table.
         
         Args:
             table_name: Имя таблицы
@@ -245,36 +189,48 @@ class RelationshipBuilder:
         Returns:
             Словарь {field_name: target_table_name}
         """
+        import logging
+        _log = logging.getLogger('RelationshipBuilder.get_related_tables')
         normalized = self._normalize_table_name(table_name)
         
         # Если таблица уже в графе связей, возвращаем её связи
         if normalized in self.relationship_graph:
             return self.relationship_graph[normalized]
         
-        # Если таблицы нет в графе, динамически строим связи для неё
-        # Это нужно для рекурсивной обработки таблиц второго уровня и выше
-        relationships = {}
+        # Приоритет 2: Индекс связей (analyzer) — полный набор, построенный для всех таблиц
+        rel_idx = getattr(self.analyzer, '_relationship_index', None)
+        if rel_idx:
+            # Пробуем оба варианта нормализации (analyzer и builder могут различаться)
+            norm_analyzer = self.analyzer._normalize_table_name(table_name) if hasattr(self.analyzer, '_normalize_table_name') else normalized
+            for key in (normalized, norm_analyzer):
+                if key in rel_idx:
+                    rels = rel_idx[key]
+                    if rels:
+                        self.relationship_graph[normalized] = dict(rels)
+                        _log.info("  [relationship_index] %s: %d полей (источник: analyzer._relationship_index)", normalized, len(rels))
+                        return self.relationship_graph[normalized]
+                    break
         
-        # Получаем поля типа binary(16)
+        # Приоритет 3: Динамически строим через _find_target_table (GUID/FK)
+        relationships = {}
         binary16_fields = self.analyzer.get_binary16_fields(normalized)
         
         if not binary16_fields:
-            # Кэшируем пустой результат, чтобы не запрашивать повторно
             self.relationship_graph[normalized] = relationships
             return relationships
         
-        # Для каждого binary(16) поля пытаемся найти целевую таблицу
         for field_name in binary16_fields:
             target_table = self._find_target_table(normalized, field_name)
             if target_table:
-                # Сохраняем только реальные имена полей (из binary16_fields).
-                # Не добавляем field_key_no_rref: build_mixed_graph итерирует по ключам как по именам полей,
-                # добавление варианта без RRef создаёт связи по несуществующим полям (напр. _Document653_I).
                 relationships[field_name] = target_table
         
-        # ВСЕГДА кэшируем результат (даже пустой) для предотвращения повторных SQL-запросов
-        self.relationship_graph[normalized] = relationships
+        # Логируем, если нашли связи только через _find_target_table (не через relationship_index)
+        if relationships and not rel_idx:
+            _log.info("  [_find_target_table] %s: %d полей (relationship_index отсутствовал)", normalized, len(relationships))
+        elif relationships:
+            _log.info("  [_find_target_table] %s: %d полей (fallback, relationship_index не содержал таблицу)", normalized, len(relationships))
         
+        self.relationship_graph[normalized] = relationships
         return relationships
     
     def _normalize_table_name(self, table_name: str) -> str:
@@ -323,12 +279,12 @@ class RelationshipBuilder:
             return '_' + table_name
         return table_name
     
-    def get_all_relationships(self) -> Dict[str, Dict[str, str]]:
+    def get_all_relationships(self) -> Dict[str, Dict[str, List[str]]]:
         """
         Возвращает весь граф связей.
         
         Returns:
-            Граф связей: {table_name: {field_name: target_table_name}}
+            Граф связей: {table_name: {field_name: [target_table, ...]}}
         """
         return self.relationship_graph
     
@@ -365,17 +321,21 @@ class RelationshipBuilder:
             for table_name, rels in rel_idx.items():
                 if table_name == normalized_base:
                     continue
-                for field_name, target_table in rels.items():
-                    if self._normalize_table_name(target_table) == normalized_base:
-                        _add(table_name, field_name)
+                for field_name, target_tables in rels.items():
+                    for target_table in (target_tables if isinstance(target_tables, list) else [target_tables]):
+                        if self._normalize_table_name(target_table) == normalized_base:
+                            _add(table_name, field_name)
+                            break
 
         # 2. Кэш прямых связей (fallback — таблицы, обработанные BFS)
         for table_name, rels in self.relationship_graph.items():
             if table_name == normalized_base:
                 continue
-            for field_name, target_table in rels.items():
-                if self._normalize_table_name(target_table) == normalized_base:
-                    _add(table_name, field_name)
+            for field_name, target_tables in rels.items():
+                for target_table in (target_tables if isinstance(target_tables, list) else [target_tables]):
+                    if self._normalize_table_name(target_table) == normalized_base:
+                        _add(table_name, field_name)
+                        break
 
         return reverse_relationships
     
@@ -502,7 +462,7 @@ class RelationshipBuilder:
             
             # Строим GUID индекс если еще не построен
             if self._guid_index is None:
-                self._guid_index = self.analyzer.build_guid_index(limit_per_table=100)
+                self._guid_index = self.analyzer.build_guid_index()
             
             # Для каждой таблицы проверяем поля binary(16)
             for table_name in tables_1c:
@@ -637,7 +597,7 @@ class RelationshipBuilder:
                 _log.info("  GUID index from cache: %d entries  (%.1fs)", len(self._guid_index), _time.time() - _t1)
             else:
                 _log.info("  Building GUID index from scratch...")
-                self._guid_index = self.analyzer.build_guid_index(limit_per_table=100)
+                self._guid_index = self.analyzer.build_guid_index()
                 _log.info("  GUID index built: %d entries  (%.1fs)", len(self._guid_index), _time.time() - _t1)
         else:
             _log.info("  GUID index already loaded: %d entries", len(self._guid_index))
@@ -696,35 +656,36 @@ class RelationshipBuilder:
                 if _elapsed_fwd > 1.0:
                     _log.warning("    ↓ get_related_tables(%s) SLOW: %.1fs  (%d fields)", current_table, _elapsed_fwd, len(forward_rels))
 
-                for field_name, target_table in forward_rels.items():
-                    if not self.analyzer.table_exists(target_table):
-                        continue
+                for field_name, target_tables in forward_rels.items():
+                    for target_table in (target_tables if isinstance(target_tables, list) else [target_tables]):
+                        if not self.analyzer.table_exists(target_table):
+                            continue
 
-                    new_sd = sd + 1
-                    new_su = su
-                    rk = f"{current_table}|{field_name}|{target_table}|fwd|sd{new_sd}_su{new_su}"
-                    if rk in visited_keys:
-                        continue
-                    visited_keys.add(rk)
+                        new_sd = sd + 1
+                        new_su = su
+                        rk = f"{current_table}|{field_name}|{target_table}|fwd|sd{new_sd}_su{new_su}"
+                        if rk in visited_keys:
+                            continue
+                        visited_keys.add(rk)
 
-                    target_alias = _get_alias(target_table, current_table, field_name)
-                    source_alias = _get_alias(current_table) if current_table != normalized_base else self._generate_table_alias(current_table, structure_parser)
+                        target_alias = _get_alias(target_table, current_table, field_name)
+                        source_alias = _get_alias(current_table) if current_table != normalized_base else self._generate_table_alias(current_table, structure_parser)
 
-                    results.append({
-                        'source_table': current_table,
-                        'source_alias': source_alias,
-                        'field_name': field_name,
-                        'target_table': target_table,
-                        'target_alias': target_alias,
-                        'direction': 'forward',
-                        'steps_down': new_sd,
-                        'steps_up': new_su,
-                        'depth': new_sd + new_su,
-                        'relationship_key': rk,
-                    })
+                        results.append({
+                            'source_table': current_table,
+                            'source_alias': source_alias,
+                            'field_name': field_name,
+                            'target_table': target_table,
+                            'target_alias': target_alias,
+                            'direction': 'forward',
+                            'steps_down': new_sd,
+                            'steps_up': new_su,
+                            'depth': new_sd + new_su,
+                            'relationship_key': rk,
+                        })
 
-                    if new_sd < max_depth_down or new_su < max_depth_up:
-                        queue.append((target_table, new_sd, new_su))
+                        if new_sd < max_depth_down or new_su < max_depth_up:
+                            queue.append((target_table, new_sd, new_su))
 
             # ── Шаги ВВЕРХ ──
             # Длина пути до дочернего узла = sd+su+1; не превышаем max_depth_down + max_depth_up

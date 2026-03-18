@@ -37,7 +37,7 @@ def test_guid_heuristic():
     # Строим индекс GUID
     print("\n1. Построение индекса GUID...")
     analyzer.clear_guid_index_cache()
-    guid_index = analyzer.build_guid_index(limit_per_table=100)
+    guid_index = analyzer.build_guid_index()
     print(f"   Индекс содержит {len(guid_index)} записей")
     
     # Проверяем, есть ли наш GUID в индексе

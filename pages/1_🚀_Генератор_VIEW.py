@@ -416,6 +416,14 @@ with col_rebuild_ri:
             if _ri_ok2:
                 st.rerun()
 
+# Висячие ключи (unresolved) — поля с данными, но без найденной цели в guid_index
+_unresolved = getattr(analyzer, '_unresolved_fields', None) or {}
+if _unresolved:
+    _ur_total = sum(len(v) for v in _unresolved.values())
+    with st.expander(f"⚠️ Висячие ключи: {_ur_total} полей в {len(_unresolved)} таблицах", expanded=False):
+        for tbl, fields in sorted(_unresolved.items()):
+            st.text(f"  {tbl}: {', '.join(fields)}")
+
 st.markdown("---")
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -548,6 +556,10 @@ if _fs_loaded and analyzer._field_stats_cache:
                 st.markdown(f"**{_fs_selected}**: {_tbl_total} полей, 🗑️ мусорных: {_tbl_junk}")
 
                 # Строим таблицу
+                _rel_idx = getattr(analyzer, '_relationship_index', None) or {}
+                _table_rels = _rel_idx.get(_fs_selected, {}) or _rel_idx.get(
+                    analyzer._normalize_table_name(_fs_selected) if hasattr(analyzer, '_normalize_table_name') else _fs_selected, {}
+                )
                 _rows = []
                 for fname, finfo in sorted(_tbl_stats.items(), key=lambda x: x[1].get('distinct_count', 0)):
                     dc = finfo.get('distinct_count', -1)
@@ -559,12 +571,27 @@ if _fs_loaded and analyzer._field_stats_cache:
                     human_fname = _fs_sp.get_field_human_name(_fs_selected, fname) if _fs_sp else None
                     fname_display = f"{human_fname} ({fname})" if human_fname else fname
                     
+                    # Связанная таблица: только для binary(16), из relationship_index (List[str])
+                    _is_binary16 = dt and 'binary' in str(dt).lower() and (ml == 16 or str(ml) == '16')
+                    _targets = _table_rels.get(fname, []) if _is_binary16 else []
+                    if isinstance(_targets, str):
+                        _targets = [_targets]
+                    if _targets:
+                        _linked = ", ".join(_targets)
+                    elif _is_binary16:
+                        _ur = getattr(analyzer, '_unresolved_fields', None) or {}
+                        _is_hanging = fname in (_ur.get(_fs_selected, []))
+                        _linked = "🔑 висячий" if (_is_hanging and not is_junk) else "—"
+                    else:
+                        _linked = ""
+                    
                     _rows.append({
                         "": marker,
                         "Поле": fname_display,
                         "Тип": f"{dt}({ml})" if ml else dt,
                         "DISTINCT": dc,
-                        "Статус": "мусор" if is_junk else "ок"
+                        "Статус": "мусор" if is_junk else "ок",
+                        "Связанная таблица": _linked
                     })
                 st.dataframe(_rows, use_container_width=True, hide_index=True)
         else:
@@ -1243,7 +1270,7 @@ if st.button("🔍 Построить граф связей", type="primary", ke
                         st.write("⏳ GUID-индекс не найден — строю с нуля (это может занять несколько минут)...")
                         _ui_log.info("  Building GUID index from scratch...")
                         _t_guid = _ui_time.time()
-                        _built_idx = analyzer.build_guid_index(limit_per_table=100)
+                        _built_idx = analyzer.build_guid_index()
                         st.write(f"✅ GUID-индекс построен: {len(_built_idx):,} записей за {_ui_time.time() - _t_guid:.1f}с")
                         _ui_log.info("  GUID index built: %d entries (%.1fs)", len(_built_idx), _ui_time.time() - _t_guid)
 
@@ -1258,7 +1285,11 @@ if st.button("🔍 Построить граф связей", type="primary", ke
                         _ri_cnt = sum(len(v) for v in _ri_disk.values())
                         st.write(f"✅ Индекс связей загружен с диска: {len(_ri_disk):,} таблиц, {_ri_cnt:,} полей")
                     else:
-                        st.write("⏳ Индекс связей не найден — строю (это может занять несколько минут)...")
+                        _n_tbl, _n_q, _t_est = analyzer.estimate_relationship_index_build()
+                        st.write(
+                            f"⏳ Индекс связей не найден — строю: ~{_n_tbl:,} таблиц, ~{_n_q:,} запросов, "
+                            f"оценка времени: {_t_est:.0f}–{_t_est * 2:.0f} сек..."
+                        )
                         _t_ri = _ui_time.time()
                         _ri_built = analyzer.build_relationship_index(
                             guid_index=analyzer._guid_to_table_cache,
@@ -1632,8 +1663,9 @@ def _render_config_section():
     # Словарь rk → rel для быстрого поиска связи по ключу (нужен для отображения пути)
     _rk_to_rel = {r['relationship_key']: r for r in relationships}
 
-    # Маппинг (show_table, field_name) -> target_rk для binary(16) полей с связью в графе
-    _field_to_target = {}
+    # Маппинг (show_table, field_name) -> [target_rk, ...] для binary(16) полей
+    from collections import defaultdict
+    _field_to_target = defaultdict(list)
     for rel in relationships:
         rk = rel['relationship_key']
         direction = rel.get('direction', 'forward')
@@ -1642,12 +1674,29 @@ def _render_config_section():
         else:
             show_t = rel['target_table']
         fn = rel['field_name']
-        _field_to_target[(show_t, fn)] = rk
+        if rk not in _field_to_target[(show_t, fn)]:
+            _field_to_target[(show_t, fn)].append(rk)
 
     _root_key = f"__root__{selected_table_db}"
 
+    def _on_field_toggle(rk_arg, cname_arg, fkey_arg):
+        """on_change callback: обновляет excluded_fields из виджета. excluded_fields — единственный источник правды."""
+        val = st.session_state.get(fkey_arg)
+        if val is None:
+            return
+        excl = st.session_state.get('gen_excluded_fields', {})
+        s = excl.get(rk_arg, set())
+        if isinstance(s, list):
+            s = set(s)
+        if val:
+            s.discard(cname_arg)
+        else:
+            s.add(cname_arg)
+        excl[rk_arg] = s
+        st.session_state.gen_excluded_fields = excl
+
     def _sync_excluded_for_rel(rel):
-        """Синхронизирует excluded_fields из session_state для данной связи. Возвращает (n_included, n_total, cols)."""
+        """Инициализирует excluded_fields для связи (если нет) и возвращает (n_included, n_total, cols)."""
         rk = rel['relationship_key']
         direction = rel.get('direction', 'forward')
         show_table = rel['source_table'] if direction == 'reverse' else rel['target_table']
@@ -1656,20 +1705,6 @@ def _render_config_section():
             return 0, 0, []
         if rk not in excluded_fields:
             excluded_fields[rk] = {c[0] for c in cols}
-        new_excluded = set()
-        for cname, _, _ in cols:
-            if not _is_field_visible_for_display(show_table, cname):
-                if cname in excluded_fields[rk]:
-                    new_excluded.add(cname)
-                continue
-            fkey = f"gen_f_{rk}_{cname}"
-            if fkey in st.session_state:
-                if not st.session_state[fkey]:
-                    new_excluded.add(cname)
-            else:
-                if cname in excluded_fields[rk]:
-                    new_excluded.add(cname)
-        excluded_fields[rk] = new_excluded
         n_total = len(cols)
         n_included = n_total - len(excluded_fields[rk])
         return n_included, n_total, cols
@@ -1726,6 +1761,7 @@ def _render_config_section():
                     if st.button("▼ Развернуть", key=f"expand_{rk}"):
                         _expanded_nodes.add(rk)
                         st.session_state['_config_expanded_nodes'] = _expanded_nodes
+                        st.session_state.gen_excluded_fields = excluded_fields
                         st.rerun()
             else:
                 # Развёрнутый узел: кнопка свернуть, link, join_type, поля
@@ -1751,6 +1787,7 @@ def _render_config_section():
                             st.session_state._nav_scroll_to_rk = _back_rk
                             st.session_state._nav_back_to_rk = None
                             st.session_state._nav_arrived_at_rk = None
+                            st.session_state.gen_excluded_fields = excluded_fields
                             st.rerun()
                     with row3:
                         if st.button("▲ Свернуть", key=f"collapse_{rk}"):
@@ -1758,6 +1795,7 @@ def _render_config_section():
                             st.session_state['_config_expanded_nodes'] = _expanded_nodes
                             st.session_state._nav_arrived_at_rk = None
                             st.session_state._nav_back_to_rk = None
+                            st.session_state.gen_excluded_fields = excluded_fields
                             st.rerun()
                 else:
                     row1, row2 = st.columns([4, 1])
@@ -1765,6 +1803,7 @@ def _render_config_section():
                         if st.button("▲ Свернуть", key=f"collapse_{rk}"):
                             _expanded_nodes.discard(rk)
                             st.session_state['_config_expanded_nodes'] = _expanded_nodes
+                            st.session_state.gen_excluded_fields = excluded_fields
                             st.rerun()
                 with row1:
                     st.markdown(header)
@@ -1845,27 +1884,71 @@ def _render_config_section():
                             target_col = col_left if vis_idx % 2 == 0 else col_right
                             with target_col:
                                 is_included = cname not in excluded_fields.get(excl_key, set())
-                                target_rk = _field_to_target.get((tgt, cname)) if cat == 'ref16' else None
+                                target_rks = _field_to_target.get((tgt, cname), []) if cat == 'ref16' else []
                                 if cat == 'ref16':
-                                    cb_col, btn_col = st.columns([4, 1])
-                                    with cb_col:
-                                        st.checkbox(c_label, value=is_included, key=f"gen_f_{rk}_{cname}")
-                                    with btn_col:
-                                        if target_rk:
-                                            trg_rel = _rk_to_rel.get(target_rk)
+                                    if len(target_rks) > 1:
+                                        cb_col, sel_col, btn_col = st.columns([3, 2, 1])
+                                        with cb_col:
+                                            _fkey = f"gen_f_{rk}_{cname}"
+                                            st.checkbox(c_label, value=is_included, key=_fkey,
+                                                        on_change=_on_field_toggle, args=(excl_key, cname, _fkey))
+                                        with sel_col:
+                                            _nav_opts = []
+                                            for trk in target_rks:
+                                                tr = _rk_to_rel.get(trk)
+                                                if tr:
+                                                    t_tbl = tr['target_table'] if tr.get('direction') == 'forward' else tr['source_table']
+                                                    t_h = sp.get_table_human_name(t_tbl) if sp else ''
+                                                    _nav_opts.append((f"{t_h} ({t_tbl})" if t_h else t_tbl, trk))
+                                                else:
+                                                    _nav_opts.append((trk, trk))
+                                            _sel_labels = [o[0] for o in _nav_opts]
+                                            _chosen_idx = st.selectbox(
+                                                "Цель", range(len(_sel_labels)),
+                                                format_func=lambda i: _sel_labels[i],
+                                                key=f"nav_sel_{rk}_{cname}",
+                                                label_visibility="collapsed"
+                                            )
+                                            _chosen_rk = _nav_opts[_chosen_idx][1]
+                                        with btn_col:
+                                            if st.button("→", key=f"nav_to_{rk}_{cname}", help="Перейти к настройке таблицы"):
+                                                _expanded_nodes.add(_chosen_rk)
+                                                st.session_state['_config_expanded_nodes'] = _expanded_nodes
+                                                st.session_state._nav_back_to_rk = rk
+                                                st.session_state._nav_scroll_to_rk = _chosen_rk
+                                                st.session_state.gen_excluded_fields = excluded_fields
+                                                st.rerun()
+                                    elif len(target_rks) == 1:
+                                        cb_col, btn_col = st.columns([4, 1])
+                                        with cb_col:
+                                            _fkey = f"gen_f_{rk}_{cname}"
+                                            st.checkbox(c_label, value=is_included, key=_fkey,
+                                                        on_change=_on_field_toggle, args=(excl_key, cname, _fkey))
+                                        with btn_col:
+                                            _trk = target_rks[0]
+                                            trg_rel = _rk_to_rel.get(_trk)
                                             trg_t = trg_rel['target_table'] if trg_rel and trg_rel.get('direction') == 'forward' else (trg_rel['source_table'] if trg_rel else '')
                                             trg_h = sp.get_table_human_name(trg_t) if sp and trg_t else ''
                                             tip = f"Перейти к настройке таблицы {trg_h or trg_t}"
                                             if st.button("→", key=f"nav_to_{rk}_{cname}", help=tip):
-                                                _expanded_nodes.add(target_rk)
+                                                _expanded_nodes.add(_trk)
                                                 st.session_state['_config_expanded_nodes'] = _expanded_nodes
                                                 st.session_state._nav_back_to_rk = rk
-                                                st.session_state._nav_scroll_to_rk = target_rk
+                                                st.session_state._nav_scroll_to_rk = _trk
+                                                st.session_state.gen_excluded_fields = excluded_fields
                                                 st.rerun()
-                                        else:
+                                    else:
+                                        cb_col, btn_col = st.columns([4, 1])
+                                        with cb_col:
+                                            _fkey = f"gen_f_{rk}_{cname}"
+                                            st.checkbox(c_label, value=is_included, key=_fkey,
+                                                        on_change=_on_field_toggle, args=(excl_key, cname, _fkey))
+                                        with btn_col:
                                             st.button("→", key=f"nav_to_{rk}_{cname}", disabled=True, help="Нет связи в графе")
                                 else:
-                                    st.checkbox(c_label, value=is_included, key=f"gen_f_{rk}_{cname}")
+                                    _fkey = f"gen_f_{rk}_{cname}"
+                                    st.checkbox(c_label, value=is_included, key=_fkey,
+                                                on_change=_on_field_toggle, args=(excl_key, cname, _fkey))
                             vis_idx += 1
                         st.markdown("---")
 
@@ -1880,20 +1963,6 @@ def _render_config_section():
     if root_cols:
         if _root_key not in excluded_fields:
             excluded_fields[_root_key] = {c[0] for c in root_cols}
-        new_excl_root = set()
-        for cname, _, _ in root_cols:
-            if not _is_field_visible_for_display(selected_table_db, cname):
-                if cname in excluded_fields[_root_key]:
-                    new_excl_root.add(cname)
-                continue
-            fkey = f"gen_f_{_root_key}_{cname}"
-            if fkey in st.session_state:
-                if not st.session_state[fkey]:
-                    new_excl_root.add(cname)
-            else:
-                if cname in excluded_fields[_root_key]:
-                    new_excl_root.add(cname)
-        excluded_fields[_root_key] = new_excl_root
         n_included_root = n_total_root - len(excluded_fields[_root_key])
 
     root_header = f"⭐ Корневая таблица: {root_display} — полей: {n_included_root}/{n_total_root}"
@@ -1923,6 +1992,7 @@ def _render_config_section():
                     st.session_state._nav_scroll_to_rk = back_rk
                     st.session_state._nav_back_to_rk = None
                     st.session_state._nav_arrived_at_rk = None
+                    st.session_state.gen_excluded_fields = excluded_fields
                     st.rerun()
             panel_key_root = f"_panel_{_root_key}"
             if panel_key_root not in st.session_state:
@@ -1974,28 +2044,73 @@ def _render_config_section():
                     target_col = col_left if vis_idx % 2 == 0 else col_right
                     with target_col:
                         is_included = cname not in excluded_fields[_root_key]
-                        target_rk = _field_to_target.get((selected_table_db, cname)) if cat == 'ref16' else None
+                        target_rks = _field_to_target.get((selected_table_db, cname), []) if cat == 'ref16' else []
                         if cat == 'ref16':
-                            cb_col, btn_col = st.columns([4, 1])
-                            with cb_col:
-                                st.checkbox(c_label, value=is_included, key=f"gen_f_{_root_key}_{cname}")
-                            with btn_col:
-                                if target_rk:
-                                    trg_rel = _rk_to_rel.get(target_rk)
+                            if len(target_rks) > 1:
+                                cb_col, sel_col, btn_col = st.columns([3, 2, 1])
+                                with cb_col:
+                                    _fkey = f"gen_f_{_root_key}_{cname}"
+                                    st.checkbox(c_label, value=is_included, key=_fkey,
+                                                on_change=_on_field_toggle, args=(_root_key, cname, _fkey))
+                                with sel_col:
+                                    _nav_opts_r = []
+                                    for trk in target_rks:
+                                        tr = _rk_to_rel.get(trk)
+                                        if tr:
+                                            t_tbl = tr['target_table'] if tr.get('direction') == 'forward' else tr['source_table']
+                                            t_h = sp.get_table_human_name(t_tbl) if sp else ''
+                                            _nav_opts_r.append((f"{t_h} ({t_tbl})" if t_h else t_tbl, trk))
+                                        else:
+                                            _nav_opts_r.append((trk, trk))
+                                    _sel_labels_r = [o[0] for o in _nav_opts_r]
+                                    _chosen_idx_r = st.selectbox(
+                                        "Цель", range(len(_sel_labels_r)),
+                                        format_func=lambda i: _sel_labels_r[i],
+                                        key=f"nav_sel_{_root_key}_{cname}",
+                                        label_visibility="collapsed"
+                                    )
+                                    _chosen_rk_r = _nav_opts_r[_chosen_idx_r][1]
+                                with btn_col:
+                                    if st.button("→", key=f"nav_to_{_root_key}_{cname}", help="Перейти к настройке таблицы"):
+                                        _expanded_nodes = set(st.session_state.get('_config_expanded_nodes', set()))
+                                        _expanded_nodes.add(_chosen_rk_r)
+                                        st.session_state['_config_expanded_nodes'] = _expanded_nodes
+                                        st.session_state._nav_back_to_rk = _root_key
+                                        st.session_state._nav_scroll_to_rk = _chosen_rk_r
+                                        st.session_state.gen_excluded_fields = excluded_fields
+                                        st.rerun()
+                            elif len(target_rks) == 1:
+                                cb_col, btn_col = st.columns([4, 1])
+                                with cb_col:
+                                    _fkey = f"gen_f_{_root_key}_{cname}"
+                                    st.checkbox(c_label, value=is_included, key=_fkey,
+                                                on_change=_on_field_toggle, args=(_root_key, cname, _fkey))
+                                with btn_col:
+                                    _trk = target_rks[0]
+                                    trg_rel = _rk_to_rel.get(_trk)
                                     trg_t = trg_rel['target_table'] if trg_rel and trg_rel.get('direction') == 'forward' else (trg_rel['source_table'] if trg_rel else '')
                                     trg_h = sp.get_table_human_name(trg_t) if sp and trg_t else ''
                                     tip = f"Перейти к настройке таблицы {trg_h or trg_t}"
                                     if st.button("→", key=f"nav_to_{_root_key}_{cname}", help=tip):
                                         _expanded_nodes = set(st.session_state.get('_config_expanded_nodes', set()))
-                                        _expanded_nodes.add(target_rk)
+                                        _expanded_nodes.add(_trk)
                                         st.session_state['_config_expanded_nodes'] = _expanded_nodes
                                         st.session_state._nav_back_to_rk = _root_key
-                                        st.session_state._nav_scroll_to_rk = target_rk
+                                        st.session_state._nav_scroll_to_rk = _trk
+                                        st.session_state.gen_excluded_fields = excluded_fields
                                         st.rerun()
-                                else:
+                            else:
+                                cb_col, btn_col = st.columns([4, 1])
+                                with cb_col:
+                                    _fkey = f"gen_f_{_root_key}_{cname}"
+                                    st.checkbox(c_label, value=is_included, key=_fkey,
+                                                on_change=_on_field_toggle, args=(_root_key, cname, _fkey))
+                                with btn_col:
                                     st.button("→", key=f"nav_to_{_root_key}_{cname}", disabled=True, help="Нет связи в графе")
                         else:
-                            st.checkbox(c_label, value=is_included, key=f"gen_f_{_root_key}_{cname}")
+                            _fkey = f"gen_f_{_root_key}_{cname}"
+                            st.checkbox(c_label, value=is_included, key=_fkey,
+                                        on_change=_on_field_toggle, args=(_root_key, cname, _fkey))
                     vis_idx += 1
                 st.markdown("---")
         else:
@@ -2180,10 +2295,12 @@ def _render_config_section():
             with col_first:
                 if st.button("⏮ В начало", key="gen_rels_first", disabled=(page <= 0)):
                     st.session_state.gen_rels_page = 0
+                    st.session_state.gen_excluded_fields = excluded_fields
                     st.rerun()
             with col_prev:
                 if st.button("◀ Пред.", key="gen_rels_prev", disabled=(page <= 0)):
                     st.session_state.gen_rels_page = page - 1
+                    st.session_state.gen_excluded_fields = excluded_fields
                     st.rerun()
             with col_center:
                 # Синхронизируем значение selectbox с текущей страницей (gen_rels_page — источник истины)
@@ -2198,15 +2315,18 @@ def _render_config_section():
                 )
                 if _page_1 != page + 1:
                     st.session_state.gen_rels_page = _page_1 - 1
+                    st.session_state.gen_excluded_fields = excluded_fields
                     st.rerun()
                 st.caption(f"{page + 1} из {n_pages} (показаны таблицы с {page_start + 1} до {page_end} из {n_total})")
             with col_next:
                 if st.button("След. ▶", key="gen_rels_next", disabled=(page >= n_pages - 1)):
                     st.session_state.gen_rels_page = page + 1
+                    st.session_state.gen_excluded_fields = excluded_fields
                     st.rerun()
             with col_last:
                 if st.button("В конец ⏭", key="gen_rels_last", disabled=(page >= n_pages - 1)):
                     st.session_state.gen_rels_page = n_pages - 1
+                    st.session_state.gen_excluded_fields = excluded_fields
                     st.rerun()
 
         for rel in _rels_to_show[page_start:page_end]:
@@ -2524,23 +2644,8 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
             ts = datetime.now()
             safe_name = selected_table_db.replace('.', '_').replace(' ', '_').lstrip('_')
 
-            # Принудительная синхронизация excluded_fields из чекбоксов (fragment мог не успеть)
-            _root_key_sync = f"__root__{selected_table_db}"
-            _root_cols = _get_table_columns_cached(st.session_state.connection_string, selected_table_db)
-            if _root_key_sync not in excluded_fields:
-                excluded_fields[_root_key_sync] = set()
-            _new_excl_root = {c[0] for c in (_root_cols or []) if not st.session_state.get(f"gen_f_{_root_key_sync}_{c[0]}", True)}
-            excluded_fields[_root_key_sync] = _new_excl_root
-            for _rel in relationships:
-                _rk = _rel['relationship_key']
-                _dir = _rel.get('direction', 'forward')
-                _tbl = _rel['target_table'] if _dir == 'forward' else _rel['source_table']
-                _cols = _get_table_columns_cached(st.session_state.connection_string, _tbl)
-                if _rk not in excluded_fields:
-                    excluded_fields[_rk] = set()
-                _new_excl = {c[0] for c in (_cols or []) if not st.session_state.get(f"gen_f_{_rk}_{c[0]}", True)}
-                excluded_fields[_rk] = _new_excl
-            st.session_state.gen_excluded_fields = excluded_fields
+            # Исключена дублирующая пересинхронизация
+            # excluded_fields уже корректно обновлен в _sync_excluded_for_rel
 
             # Конвертируем excluded_fields sets в lists для JSON
             excl_serializable = {}
@@ -2909,22 +3014,7 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                         if rk not in _tc:
                             _tc[rk] = {'enabled': False, 'join_type': 'INNER JOIN'}
                         _tc[rk]['join_type'] = str(st.session_state.get(jk, 'INNER JOIN'))
-                # Синхронизация excluded_fields из чекбоксов (fragment мог не успеть обновить)
                 _excl = dict(st.session_state.gen_excluded_fields)
-                _root_key_gen = f"__root__{selected_table_db}"
-                _root_cols_gen = _get_table_columns_cached(st.session_state.connection_string, selected_table_db)
-                if _root_key_gen not in _excl:
-                    _excl[_root_key_gen] = set()
-                _excl[_root_key_gen] = {c[0] for c in (_root_cols_gen or []) if not st.session_state.get(f"gen_f_{_root_key_gen}_{c[0]}", True)}
-                for _rel in _rels:
-                    _rk = _rel['relationship_key']
-                    _dir = _rel.get('direction', 'forward')
-                    _tbl = _rel['target_table'] if _dir == 'forward' else _rel['source_table']
-                    _cols = _get_table_columns_cached(st.session_state.connection_string, _tbl)
-                    if _rk not in _excl:
-                        _excl[_rk] = set()
-                    _excl[_rk] = {c[0] for c in (_cols or []) if not st.session_state.get(f"gen_f_{_rk}_{c[0]}", True)}
-                st.session_state.gen_excluded_fields = _excl
 
                 _md = st.session_state.get('gen_graph_max_depth') or st.session_state.get('gen_max_depth', 999)
                 _mdu = st.session_state.get('gen_graph_max_depth_up') or st.session_state.get('gen_max_depth_up', 999)

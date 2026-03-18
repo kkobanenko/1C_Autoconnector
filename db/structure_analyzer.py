@@ -32,7 +32,8 @@ class StructureAnalyzer:
         self._primary_keys_cache: Dict[str, List[str]] = {}
         self._foreign_keys_cache: Dict[str, List[Dict]] = {}
         self._guid_to_table_cache: Optional[Dict[bytes, str]] = None  # Кэш GUID -> таблица
-        self._relationship_index: Optional[Dict[str, Dict[str, str]]] = None  # Индекс связей: {table → {field → target_table}}
+        self._relationship_index: Optional[Dict[str, Dict[str, List[str]]]] = None  # Индекс связей: {table → {field → [target_table, ...]}}
+        self._unresolved_fields: Optional[Dict[str, List[str]]] = None  # Висячие ключи: {table → [field, ...]}
         self._field_stats_cache: Optional[Dict[str, Dict[str, dict]]] = None  # Кэш статистики полей
     
     def connect(self):
@@ -545,7 +546,7 @@ class StructureAnalyzer:
         # По умолчанию схема dbo, сохраняем подчеркивание в имени таблицы
         return 'dbo', table_name
     
-    def build_guid_index(self, limit_per_table: int = 100, force_rebuild: bool = False, progress_callback=None) -> Dict[bytes, str]:
+    def build_guid_index(self, limit_per_table: int = 50000, force_rebuild: bool = False, progress_callback=None) -> Dict[bytes, str]:
         """
         Строит индекс GUID -> таблица для быстрого поиска целевых таблиц.
         Если индекс уже есть в памяти или на диске — использует его.
@@ -639,21 +640,16 @@ class StructureAnalyzer:
                 formal_pk_columns = self.get_primary_keys(normalized)
                 pk_candidate_columns.extend(formal_pk_columns)
                 
-                # Затем ищем поля, которые заканчиваются на "_IDRRef" или "IDRRef"
+                # Затем ищем поля binary(16) с подстрокой "ID" в имени
+                # (_IDRRef, _ParentIDRRef, _OwnerIDRRef, _PredefinedID и т.п.)
                 for col in columns:
                     col_name = col['name']
                     col_type = col['data_type']
                     col_max_length = col.get('max_length')
                     
-                    # Проверяем, что это binary(16) или varbinary(16)
                     if col_type in ['binary', 'varbinary'] and col_max_length == 16:
-                        # Проверяем, что имя поля равно или заканчивается на "_IDRRef" или "IDRRef"
-                        if (col_name == '_IDRRef' or 
-                            col_name == 'IDRRef' or 
-                            col_name.endswith('_IDRRef') or 
-                            col_name.endswith('IDRRef')):
-                            if col_name not in pk_candidate_columns:
-                                pk_candidate_columns.append(col_name)
+                        if 'ID' in col_name.upper() and col_name not in pk_candidate_columns:
+                            pk_candidate_columns.append(col_name)
                 
                 # Если не нашли подходящих полей, пробуем стандартные имена для 1С
                 if not pk_candidate_columns:
@@ -913,16 +909,58 @@ class StructureAnalyzer:
     # Индекс связей (relationship index): {table → {field → target_table}}
     # ═══════════════════════════════════════════════════════════════════
 
+    def estimate_relationship_index_build(self) -> Tuple[int, int, float]:
+        """
+        Оценивает объём и время построения индекса связей.
+        
+        Returns:
+            (n_tables, n_queries_estimate, time_estimate_sec)
+        """
+        all_tables = self.get_all_tables()
+        tables_1c = []
+        for t in all_tables:
+            if t.startswith('[') and '.' in t:
+                continue
+            table_simple = t.strip('[]')
+            if '.' in table_simple:
+                table_simple = table_simple.split('.')[-1]
+            if (table_simple.startswith('_') or
+                table_simple.startswith('Document') or
+                table_simple.startswith('Reference') or
+                table_simple.startswith('Enum')):
+                tables_1c.append(table_simple)
+        n_tables = len(tables_1c)
+        if n_tables == 0:
+            return 0, 0, 0.0
+        # Выборочно считаем поля binary(16) в первых 20 таблицах для оценки
+        sample_size = min(20, n_tables)
+        total_fields = 0
+        for i in range(sample_size):
+            try:
+                norm = self._normalize_table_name(tables_1c[i])
+                fields = self.get_binary16_fields(norm)
+                if fields:
+                    # Исключаем IDRRef, ID, Version, Marked
+                    n = sum(1 for f in fields if f.lstrip('_') not in ('IDRRef', 'ID', 'Version', 'Marked'))
+                    total_fields += n
+            except Exception:
+                pass
+        avg_per_table = total_fields / sample_size if sample_size > 0 else 8
+        n_queries = int(n_tables * avg_per_table)
+        # ~0.03–0.1 сек на запрос в зависимости от размера таблицы
+        time_estimate = n_queries * 0.05
+        return n_tables, n_queries, time_estimate
+
     def build_relationship_index(
         self,
         guid_index: Optional[Dict[bytes, str]] = None,
         force_rebuild: bool = False,
         progress_callback: Optional[Callable[[int, int, str], None]] = None
-    ) -> Dict[str, Dict[str, str]]:
+    ) -> Dict[str, Dict[str, List[str]]]:
         """
         Строит индекс связей для ВСЕХ таблиц 1С.
-        Для каждой таблицы и каждого поля binary(16) определяет целевую таблицу
-        через GUID-индекс (без тяжёлых SQL-запросов на каждое поле каждой таблицы).
+        Для каждого поля binary(16) собирает ВСЕ целевые таблицы (по частоте).
+        Поля с данными, но без найденной цели — висячие ключи (_unresolved_fields).
 
         Args:
             guid_index: Основной GUID-индекс {guid_bytes → table_name}. Если None — берёт из кэша.
@@ -930,7 +968,7 @@ class StructureAnalyzer:
             progress_callback: callback(current, total, table_name)
 
         Returns:
-            {table_name: {field_name: target_table_name}}
+            {table_name: {field_name: [target_table, ...]}} — список отсортирован по убыванию частоты
         """
         if not force_rebuild and self._relationship_index is not None:
             return self._relationship_index
@@ -963,7 +1001,8 @@ class StructureAnalyzer:
                 table_simple.startswith('Enum')):
                 tables_1c.append(table_simple)
 
-        rel_index: Dict[str, Dict[str, str]] = {}
+        rel_index: Dict[str, Dict[str, List[str]]] = {}
+        unresolved_index: Dict[str, List[str]] = {}
         total = len(tables_1c)
 
         for idx, table_name in enumerate(tables_1c):
@@ -976,23 +1015,28 @@ class StructureAnalyzer:
                     continue
 
                 schema, table = self._parse_table_name(normalized)
-                table_rels: Dict[str, str] = {}
+                table_rels: Dict[str, List[str]] = {}
+                unresolved_fields: List[str] = []
 
                 for field_name in binary16_fields:
-                    # Пропускаем PK-поля (_IDRRef и т.п.)
                     field_clean = field_name.lstrip('_')
                     if field_clean in ('IDRRef', 'ID', 'Version', 'Marked'):
                         continue
                     try:
                         query = (
-                            f"SELECT TOP 1 [{field_name}] "
+                            f"SELECT DISTINCT TOP 50000 [{field_name}] "
                             f"FROM [{schema}].[{table}] "
                             f"WHERE [{field_name}] IS NOT NULL "
                             f"AND [{field_name}] != 0x00000000000000000000000000000000"
                         )
                         cursor.execute(query)
-                        row = cursor.fetchone()
-                        if row and row[0]:
+                        rows = cursor.fetchall()
+                        field_targets: Dict[str, int] = {}
+                        has_data = False
+                        for row in rows:
+                            if not row or not row[0]:
+                                continue
+                            has_data = True
                             guid_value = row[0]
                             if isinstance(guid_value, bytearray):
                                 guid_bytes = bytes(guid_value)
@@ -1003,18 +1047,31 @@ class StructureAnalyzer:
                             if len(guid_bytes) == 16:
                                 target = guid_index.get(guid_bytes)
                                 if target:
-                                    table_rels[field_name] = target
+                                    field_targets[target] = field_targets.get(target, 0) + 1
+
+                        if field_targets:
+                            sorted_targets = sorted(
+                                field_targets.keys(),
+                                key=lambda t: field_targets[t],
+                                reverse=True
+                            )
+                            table_rels[field_name] = sorted_targets
+                        elif has_data:
+                            unresolved_fields.append(field_name)
                     except Exception:
                         continue
 
                 if table_rels:
                     rel_index[normalized] = table_rels
+                if unresolved_fields:
+                    unresolved_index[normalized] = unresolved_fields
             except Exception:
                 continue
 
         cursor.close()
         self._relationship_index = rel_index
-        self._save_relationship_index(rel_index)
+        self._unresolved_fields = unresolved_index
+        self._save_relationship_index(rel_index, unresolved_index)
         return rel_index
 
     def _get_relationship_index_path(self) -> Path:
@@ -1025,31 +1082,39 @@ class StructureAnalyzer:
         output_dir.mkdir(parents=True, exist_ok=True)
         return output_dir / f"relationship_index_{safe_key}.json"
 
-    def _save_relationship_index(self, rel_index: Dict[str, Dict[str, str]]) -> bool:
-        """Сохраняет индекс связей на диск."""
+    def _save_relationship_index(
+        self,
+        rel_index: Dict[str, Dict[str, List[str]]],
+        unresolved: Optional[Dict[str, List[str]]] = None
+    ) -> bool:
+        """Сохраняет индекс связей на диск (version 2)."""
         try:
             from datetime import datetime
             host, database = self._parse_connection_params()
             path = self._get_relationship_index_path()
             total_fields = sum(len(v) for v in rel_index.values())
+            unresolved = unresolved or {}
+            ur_total = sum(len(v) for v in unresolved.values())
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump({
-                    'version': 1,
+                    'version': 2,
                     'metadata': {
                         'host': host,
                         'database': database,
                         'built_at': datetime.now().isoformat(),
                         'tables': len(rel_index),
                         'fields': total_fields,
+                        'unresolved_fields': ur_total,
                     },
-                    'index': rel_index
+                    'index': rel_index,
+                    'unresolved': unresolved,
                 }, f, ensure_ascii=False)
             return True
         except Exception:
             return False
 
-    def _load_relationship_index(self) -> Optional[Dict[str, Dict[str, str]]]:
-        """Загружает индекс связей с диска. Проверяет соответствие подключению."""
+    def _load_relationship_index(self) -> Optional[Dict[str, Dict[str, List[str]]]]:
+        """Загружает индекс связей с диска. Автоконвертация v1→v2."""
         try:
             path = self._get_relationship_index_path()
             if not path.exists():
@@ -1060,7 +1125,20 @@ class StructureAnalyzer:
             current_host, current_db = self._parse_connection_params()
             if metadata.get('host') != current_host or metadata.get('database') != current_db:
                 return None
-            return data.get('index', {})
+            raw_index = data.get('index', {})
+            # Автоконвертация v1 → v2: str → [str]
+            converted: Dict[str, Dict[str, List[str]]] = {}
+            for table, fields in raw_index.items():
+                converted[table] = {}
+                for field, target in fields.items():
+                    if isinstance(target, str):
+                        converted[table][field] = [target]
+                    elif isinstance(target, list):
+                        converted[table][field] = target
+                    else:
+                        converted[table][field] = [str(target)]
+            self._unresolved_fields = data.get('unresolved', {})
+            return converted
         except Exception:
             return None
 

@@ -128,27 +128,22 @@ class ViewGenerator:
                 if col_type not in ['binary', 'varbinary'] or col_max_length != 16:
                     continue
                 
-                # Получаем целевую таблицу из графа связей
+                # Получаем целевую таблицу из графа связей (List[str] — берём первую/главную)
                 relationships_dict = self.relationship_builder.get_related_tables(table_name)
-                
-                # Пробуем найти с разными вариантами имени поля
-                target_table = relationships_dict.get(col_name)
-                
-                # Если не найдено, пробуем без суффикса RRef (4 символа)
+                def _first_target(val):
+                    if isinstance(val, list) and val:
+                        return val[0]
+                    return val if isinstance(val, str) else None
+                target_table = _first_target(relationships_dict.get(col_name))
                 if not target_table and col_name.endswith('RRef'):
-                    field_name_no_rref = col_name[:-4]  # Убираем 'RRef'
-                    target_table = relationships_dict.get(field_name_no_rref)
+                    field_name_no_rref = col_name[:-4]
+                    target_table = _first_target(relationships_dict.get(field_name_no_rref))
                     if not target_table and field_name_no_rref.startswith('_'):
-                        target_table = relationships_dict.get(field_name_no_rref.lstrip('_'))
-                
-                # Если не найдено, пробуем с подчеркиванием
+                        target_table = _first_target(relationships_dict.get(field_name_no_rref.lstrip('_')))
                 if not target_table and not col_name.startswith('_'):
-                    target_table = relationships_dict.get('_' + col_name)
-                
+                    target_table = _first_target(relationships_dict.get('_' + col_name))
                 if not target_table:
                     continue
-                
-                # Проверяем, что таблица существует
                 if not self.analyzer.table_exists(target_table):
                     continue
                 
@@ -878,25 +873,20 @@ class ViewGenerator:
             current_depth: Текущий уровень рекурсии
             max_depth: Максимальный уровень рекурсии
         """
-        # Получаем целевую таблицу из графа связей
+        # Получаем целевую таблицу из графа связей (List[str] — берём первую/главную)
         relationships = self.relationship_builder.get_related_tables(source_table)
-        
-        # В 1С поля binary(16) имеют суффикс RRef (например, _Fld10028RRef)
-        # Граф хранит реальные имена полей из БД; fallback без RRef — для совместимости
-        target_table = relationships.get(field_name)
-        
-        # Если не найдено, пробуем без суффикса RRef (4 символа)
+        def _first_target(val):
+            if isinstance(val, list) and val:
+                return val[0]
+            return val if isinstance(val, str) else None
+        target_table = _first_target(relationships.get(field_name))
         if not target_table and field_name.endswith('RRef'):
-            field_name_no_rref = field_name[:-4]  # Убираем 'RRef'
-            target_table = relationships.get(field_name_no_rref)
-            # Также пробуем без подчеркивания в начале
+            field_name_no_rref = field_name[:-4]
+            target_table = _first_target(relationships.get(field_name_no_rref))
             if not target_table and field_name_no_rref.startswith('_'):
-                target_table = relationships.get(field_name_no_rref.lstrip('_'))
-        
-        # Если не найдено, пробуем с подчеркиванием
+                target_table = _first_target(relationships.get(field_name_no_rref.lstrip('_')))
         if not target_table and not field_name.startswith('_'):
-            target_table = relationships.get('_' + field_name)
-        
+            target_table = _first_target(relationships.get('_' + field_name))
         if not target_table:
             return
         
