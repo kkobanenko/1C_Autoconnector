@@ -2274,125 +2274,119 @@ def _render_config_section():
                     st.session_state._nav_arrived_at_rk = None
                     st.session_state.gen_excluded_fields = excluded_fields
                     st.rerun()
-            panel_key_root = f"_panel_{_root_key}"
-            if panel_key_root not in st.session_state:
-                st.session_state[panel_key_root] = False
-            field_label_root = f"📋 Поля {selected_table_db} ({n_included_root}/{n_total_root})"
-            if st.button(field_label_root, key=f"gen_sf_{_root_key}"):
-                st.session_state[panel_key_root] = not st.session_state[panel_key_root]
-            if st.session_state[panel_key_root]:
-                qcol1, qcol2, qcol3 = st.columns([1, 1, 4])
-                with qcol1:
-                    if st.button("✅ Все", key=f"gen_fa_{_root_key}"):
-                        for cname, _, _ in root_cols:
-                            if _is_field_visible_for_display(selected_table_db, cname):
-                                st.session_state[f"gen_f_{_root_key}_{cname}"] = True
-                        excluded_fields[_root_key] = {
-                            c[0] for c in root_cols
-                            if not _is_field_visible_for_display(selected_table_db, c[0])
-                            and c[0] in excluded_fields[_root_key]
-                        }
-                        st.session_state.gen_excluded_fields = excluded_fields
-                with qcol2:
-                    if st.button("❌ Ничего", key=f"gen_fn_{_root_key}"):
-                        for cname, _, _ in root_cols:
-                            if _is_field_visible_for_display(selected_table_db, cname):
-                                st.session_state[f"gen_f_{_root_key}_{cname}"] = False
-                        excluded_fields[_root_key] = {
-                            c[0] for c in root_cols
-                            if _is_field_visible_for_display(selected_table_db, c[0])
-                        } | {
-                            c[0] for c in root_cols
-                            if not _is_field_visible_for_display(selected_table_db, c[0])
-                            and c[0] in excluded_fields[_root_key]
-                        }
-                        st.session_state.gen_excluded_fields = excluded_fields
+            # Список полей сразу при раскрытии expander корня (без кнопки «Поля …»).
+            qcol1, qcol2, qcol3 = st.columns([1, 1, 4])
+            with qcol1:
+                if st.button("✅ Все", key=f"gen_fa_{_root_key}"):
+                    for cname, _, _ in root_cols:
+                        if _is_field_visible_for_display(selected_table_db, cname):
+                            st.session_state[f"gen_f_{_root_key}_{cname}"] = True
+                    excluded_fields[_root_key] = {
+                        c[0] for c in root_cols
+                        if not _is_field_visible_for_display(selected_table_db, c[0])
+                        and c[0] in excluded_fields[_root_key]
+                    }
+                    st.session_state.gen_excluded_fields = excluded_fields
+            with qcol2:
+                if st.button("❌ Ничего", key=f"gen_fn_{_root_key}"):
+                    for cname, _, _ in root_cols:
+                        if _is_field_visible_for_display(selected_table_db, cname):
+                            st.session_state[f"gen_f_{_root_key}_{cname}"] = False
+                    excluded_fields[_root_key] = {
+                        c[0] for c in root_cols
+                        if _is_field_visible_for_display(selected_table_db, c[0])
+                    } | {
+                        c[0] for c in root_cols
+                        if not _is_field_visible_for_display(selected_table_db, c[0])
+                        and c[0] in excluded_fields[_root_key]
+                    }
+                    st.session_state.gen_excluded_fields = excluded_fields
 
-                # Фильтр по типам (только для видимых полей)
-                visible_root_cols = [(c, t, l) for c, t, l in root_cols if _is_field_visible_for_display(selected_table_db, c)]
-                visible_types = _render_type_filters(_root_key, visible_root_cols)
+            # Фильтр по типам (только для видимых полей)
+            visible_root_cols = [(c, t, l) for c, t, l in root_cols if _is_field_visible_for_display(selected_table_db, c)]
+            visible_types = _render_type_filters(_root_key, visible_root_cols)
 
-                col_left, col_right = st.columns(2)
-                vis_idx = 0
-                for cname, ctype, clen in visible_root_cols:
-                    cat = _classify_col_type(ctype, clen)
-                    if cat not in visible_types:
-                        continue
-                    type_str = f"{ctype}({clen})" if clen else ctype
-                    human_c = sp.get_field_human_name(selected_table_db, cname) if sp else None
-                    c_label = f"{human_c} (`{cname}` {type_str})" if human_c else f"`{cname}` {type_str}"
-                    target_col = col_left if vis_idx % 2 == 0 else col_right
-                    with target_col:
-                        is_included = cname not in excluded_fields[_root_key]
-                        target_rks = _field_to_target.get((selected_table_db, cname), []) if cat == 'ref16' else []
-                        if cat == 'ref16':
-                            if len(target_rks) > 1:
-                                cb_col, sel_col, btn_col = st.columns([3, 2, 1])
-                                with cb_col:
-                                    _fkey = f"gen_f_{_root_key}_{cname}"
-                                    st.checkbox(c_label, value=is_included, key=_fkey,
-                                                on_change=_on_field_toggle, args=(_root_key, cname, _fkey))
-                                with sel_col:
-                                    _nav_opts_r = []
-                                    for trk in target_rks:
-                                        tr = _rk_to_rel.get(trk)
-                                        if tr:
-                                            t_tbl = tr['target_table'] if tr.get('direction') == 'forward' else tr['source_table']
-                                            t_h = sp.get_table_human_name(t_tbl) if sp else ''
-                                            _nav_opts_r.append((f"{t_h} ({t_tbl})" if t_h else t_tbl, trk))
-                                        else:
-                                            _nav_opts_r.append((trk, trk))
-                                    _sel_labels_r = [o[0] for o in _nav_opts_r]
-                                    _chosen_idx_r = st.selectbox(
-                                        "Цель", range(len(_sel_labels_r)),
-                                        format_func=lambda i: _sel_labels_r[i],
-                                        key=f"nav_sel_{_root_key}_{cname}",
-                                        label_visibility="collapsed"
-                                    )
-                                    _chosen_rk_r = _nav_opts_r[_chosen_idx_r][1]
-                                with btn_col:
-                                    if st.button("→", key=f"nav_to_{_root_key}_{cname}", help="Перейти к настройке таблицы"):
-                                        _expanded_nodes = set(st.session_state.get('_config_expanded_nodes', set()))
-                                        _expanded_nodes.add(_chosen_rk_r)
-                                        st.session_state['_config_expanded_nodes'] = _expanded_nodes
-                                        st.session_state._nav_back_to_rk = _root_key
-                                        st.session_state._nav_scroll_to_rk = _chosen_rk_r
-                                        st.session_state.gen_excluded_fields = excluded_fields
-                                        st.rerun()
-                            elif len(target_rks) == 1:
-                                cb_col, btn_col = st.columns([4, 1])
-                                with cb_col:
-                                    _fkey = f"gen_f_{_root_key}_{cname}"
-                                    st.checkbox(c_label, value=is_included, key=_fkey,
-                                                on_change=_on_field_toggle, args=(_root_key, cname, _fkey))
-                                with btn_col:
-                                    _trk = target_rks[0]
-                                    trg_rel = _rk_to_rel.get(_trk)
-                                    trg_t = trg_rel['target_table'] if trg_rel and trg_rel.get('direction') == 'forward' else (trg_rel['source_table'] if trg_rel else '')
-                                    trg_h = sp.get_table_human_name(trg_t) if sp and trg_t else ''
-                                    tip = f"Перейти к настройке таблицы {trg_h or trg_t}"
-                                    if st.button("→", key=f"nav_to_{_root_key}_{cname}", help=tip):
-                                        _expanded_nodes = set(st.session_state.get('_config_expanded_nodes', set()))
-                                        _expanded_nodes.add(_trk)
-                                        st.session_state['_config_expanded_nodes'] = _expanded_nodes
-                                        st.session_state._nav_back_to_rk = _root_key
-                                        st.session_state._nav_scroll_to_rk = _trk
-                                        st.session_state.gen_excluded_fields = excluded_fields
-                                        st.rerun()
-                            else:
-                                cb_col, btn_col = st.columns([4, 1])
-                                with cb_col:
-                                    _fkey = f"gen_f_{_root_key}_{cname}"
-                                    st.checkbox(c_label, value=is_included, key=_fkey,
-                                                on_change=_on_field_toggle, args=(_root_key, cname, _fkey))
-                                with btn_col:
-                                    st.button("→", key=f"nav_to_{_root_key}_{cname}", disabled=True, help="Нет связи в графе")
+            col_left, col_right = st.columns(2)
+            vis_idx = 0
+            for cname, ctype, clen in visible_root_cols:
+                cat = _classify_col_type(ctype, clen)
+                if cat not in visible_types:
+                    continue
+                type_str = f"{ctype}({clen})" if clen else ctype
+                human_c = sp.get_field_human_name(selected_table_db, cname) if sp else None
+                c_label = f"{human_c} (`{cname}` {type_str})" if human_c else f"`{cname}` {type_str}"
+                target_col = col_left if vis_idx % 2 == 0 else col_right
+                with target_col:
+                    is_included = cname not in excluded_fields[_root_key]
+                    target_rks = _field_to_target.get((selected_table_db, cname), []) if cat == 'ref16' else []
+                    if cat == 'ref16':
+                        if len(target_rks) > 1:
+                            cb_col, sel_col, btn_col = st.columns([3, 2, 1])
+                            with cb_col:
+                                _fkey = f"gen_f_{_root_key}_{cname}"
+                                st.checkbox(c_label, value=is_included, key=_fkey,
+                                            on_change=_on_field_toggle, args=(_root_key, cname, _fkey))
+                            with sel_col:
+                                _nav_opts_r = []
+                                for trk in target_rks:
+                                    tr = _rk_to_rel.get(trk)
+                                    if tr:
+                                        t_tbl = tr['target_table'] if tr.get('direction') == 'forward' else tr['source_table']
+                                        t_h = sp.get_table_human_name(t_tbl) if sp else ''
+                                        _nav_opts_r.append((f"{t_h} ({t_tbl})" if t_h else t_tbl, trk))
+                                    else:
+                                        _nav_opts_r.append((trk, trk))
+                                _sel_labels_r = [o[0] for o in _nav_opts_r]
+                                _chosen_idx_r = st.selectbox(
+                                    "Цель", range(len(_sel_labels_r)),
+                                    format_func=lambda i: _sel_labels_r[i],
+                                    key=f"nav_sel_{_root_key}_{cname}",
+                                    label_visibility="collapsed"
+                                )
+                                _chosen_rk_r = _nav_opts_r[_chosen_idx_r][1]
+                            with btn_col:
+                                if st.button("→", key=f"nav_to_{_root_key}_{cname}", help="Перейти к настройке таблицы"):
+                                    _expanded_nodes = set(st.session_state.get('_config_expanded_nodes', set()))
+                                    _expanded_nodes.add(_chosen_rk_r)
+                                    st.session_state['_config_expanded_nodes'] = _expanded_nodes
+                                    st.session_state._nav_back_to_rk = _root_key
+                                    st.session_state._nav_scroll_to_rk = _chosen_rk_r
+                                    st.session_state.gen_excluded_fields = excluded_fields
+                                    st.rerun()
+                        elif len(target_rks) == 1:
+                            cb_col, btn_col = st.columns([4, 1])
+                            with cb_col:
+                                _fkey = f"gen_f_{_root_key}_{cname}"
+                                st.checkbox(c_label, value=is_included, key=_fkey,
+                                            on_change=_on_field_toggle, args=(_root_key, cname, _fkey))
+                            with btn_col:
+                                _trk = target_rks[0]
+                                trg_rel = _rk_to_rel.get(_trk)
+                                trg_t = trg_rel['target_table'] if trg_rel and trg_rel.get('direction') == 'forward' else (trg_rel['source_table'] if trg_rel else '')
+                                trg_h = sp.get_table_human_name(trg_t) if sp and trg_t else ''
+                                tip = f"Перейти к настройке таблицы {trg_h or trg_t}"
+                                if st.button("→", key=f"nav_to_{_root_key}_{cname}", help=tip):
+                                    _expanded_nodes = set(st.session_state.get('_config_expanded_nodes', set()))
+                                    _expanded_nodes.add(_trk)
+                                    st.session_state['_config_expanded_nodes'] = _expanded_nodes
+                                    st.session_state._nav_back_to_rk = _root_key
+                                    st.session_state._nav_scroll_to_rk = _trk
+                                    st.session_state.gen_excluded_fields = excluded_fields
+                                    st.rerun()
                         else:
-                            _fkey = f"gen_f_{_root_key}_{cname}"
-                            st.checkbox(c_label, value=is_included, key=_fkey,
-                                        on_change=_on_field_toggle, args=(_root_key, cname, _fkey))
-                    vis_idx += 1
-                st.markdown("---")
+                            cb_col, btn_col = st.columns([4, 1])
+                            with cb_col:
+                                _fkey = f"gen_f_{_root_key}_{cname}"
+                                st.checkbox(c_label, value=is_included, key=_fkey,
+                                            on_change=_on_field_toggle, args=(_root_key, cname, _fkey))
+                            with btn_col:
+                                st.button("→", key=f"nav_to_{_root_key}_{cname}", disabled=True, help="Нет связи в графе")
+                    else:
+                        _fkey = f"gen_f_{_root_key}_{cname}"
+                        st.checkbox(c_label, value=is_included, key=_fkey,
+                                    on_change=_on_field_toggle, args=(_root_key, cname, _fkey))
+                vis_idx += 1
+            st.markdown("---")
         else:
             st.warning("Не удалось получить список полей корневой таблицы.")
 
