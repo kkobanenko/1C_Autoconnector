@@ -7,6 +7,7 @@
 import streamlit as st
 from streamlit_scroll_to_top import scroll_to_here
 import json
+import re
 import traceback
 from pathlib import Path
 
@@ -21,6 +22,253 @@ from utils.db_connection import test_connection, get_connection_string_from_para
 from analyzers.fact_table_assessor import FactTableAssessor
 from analyzers.field_filter import FieldFilter
 import config
+
+
+def _parse_cfg_tags_csv(tags_str):
+    """Теги из строки «a, b» в список lower (для сохранения и SQL-meta)."""
+    if not tags_str:
+        return []
+    return [t.strip().lower() for t in tags_str.split(',') if t.strip()]
+
+
+def _cfg_view_name_chars_valid(name):
+    """VIEW name: только буквы (Unicode), цифры и подчёркивание."""
+    if not name:
+        return True
+    return bool(re.match(r'^[\w]+$', name, re.UNICODE))
+
+
+def _apply_loaded_cfg_metadata_to_widgets(full_data):
+    """Заполняет виджеты секции 11 из metadata загруженного cfg JSON."""
+    _lm = full_data.get('metadata', {}) or {}
+    st.session_state['_cfg_save_name'] = _lm.get('name') or ''
+    st.session_state['_cfg_save_view_name'] = _lm.get('view_name') or ''
+    st.session_state['_cfg_save_description'] = _lm.get('description') or ''
+    _tags = _lm.get('tags', [])
+    st.session_state['_cfg_save_tags'] = ', '.join(_tags) if isinstance(_tags, list) else str(_tags or '')
+
+
+def _normalize_table_name_for_cfg_cache(table_name: str) -> str:
+    """
+    Та же логика, что StructureAnalyzer._normalize_table_name — только str, без БД.
+    Нужна внутри st.cache_data, куда нельзя передавать экземпляр анализатора.
+    """
+    if not table_name:
+        return ''
+    if '.' in table_name:
+        parts = table_name.split('.')
+        normalized_parts = []
+        for i, part in enumerate(parts):
+            part = part.strip('[]')
+            if i == 0:
+                if not part.startswith('_'):
+                    normalized_parts.append('_' + part)
+                else:
+                    normalized_parts.append(part)
+            else:
+                part_clean = part.lstrip('_')
+                if part_clean:
+                    normalized_parts.append('_' + part_clean)
+                else:
+                    normalized_parts.append(part)
+        result = '_'.join(normalized_parts)
+        while '__' in result:
+            result = result.replace('__', '_')
+        return result
+    table_name = table_name.strip('[]')
+    if not table_name.startswith('_'):
+        return '_' + table_name
+    return table_name
+
+
+@st.cache_data(ttl=5)
+def _load_configs_for_graph(
+    configs_dir_str: str,
+    current_graph_hash: str | None,
+    fact_table_norm: str,
+    max_depth_val,
+    max_depth_up_val,
+):
+    """
+    Читает все cfg_*.json с диска и возвращает метаданные, подходящие под текущий граф/факт.
+    Кэш 5 с + явный .clear() после сохранения/удаления.
+    """
+    out = []
+    _dir = Path(configs_dir_str)
+    if not _dir.exists():
+        return out
+    for fp in sorted(_dir.glob('cfg_*.json'), reverse=True):
+        try:
+            with open(fp, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            meta = data.get('metadata', {}) or {}
+            cfg_fact = meta.get('fact_table', '')
+            if not cfg_fact:
+                continue
+            cfg_graph_hash = meta.get('graph_hash')
+            if current_graph_hash and cfg_graph_hash:
+                if cfg_graph_hash != current_graph_hash:
+                    continue
+            else:
+                cfg_norm = _normalize_table_name_for_cfg_cache(cfg_fact)
+                if cfg_norm != fact_table_norm:
+                    continue
+                if meta.get('max_depth') != max_depth_val or meta.get('max_depth_up') != max_depth_up_val:
+                    continue
+            meta = dict(meta)
+            meta['filename'] = fp.name
+            meta['filepath'] = str(fp)
+            out.append(meta)
+        except Exception:
+            continue
+    return out
+
+
+@st.cache_data(ttl=5)
+def _load_all_config_and_sql_metadata(configs_dir_str: str, sql_dir_str: str):
+    """
+    Все cfg и sql метаданные с диска (без фильтра по графу) — для сквозного поиска.
+    Фильтрация по строке запроса остаётся в UI.
+    """
+    cfgs = []
+    sqls = []
+    p_cfg = Path(configs_dir_str)
+    p_sql = Path(sql_dir_str)
+    if p_cfg.exists():
+        for fp in sorted(p_cfg.glob('cfg_*.json'), reverse=True):
+            try:
+                with open(fp, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                meta = dict(data.get('metadata', {}) or {})
+                meta['filepath'] = str(fp)
+                meta['filename'] = fp.name
+                cfgs.append(meta)
+            except Exception:
+                continue
+    if p_sql.exists():
+        for fp in sorted(p_sql.glob('sql_*.json'), reverse=True):
+            try:
+                with open(fp, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+                meta = dict(meta)
+                meta['filepath'] = str(fp)
+                meta['filename'] = fp.name
+                sqls.append(meta)
+            except Exception:
+                continue
+    return cfgs, sqls
+
+
+def _invalidate_project_config_metadata_caches():
+    """После записи/удаления cfg на диск — сброс кэшей списков и поиска."""
+    _load_configs_for_graph.clear()
+    _load_all_config_and_sql_metadata.clear()
+
+
+def _render_cfg_sql_global_search(search_query: str):
+    """Сквозной поиск по всем cfg_*.json и sql_*.json (без фильтра по графу)."""
+    _CONFIGS_DIR_SEARCH = Path(config.DEFAULT_OUTPUT_DIR) / "configs"
+    _SQL_DIR_SEARCH = Path(config.DEFAULT_OUTPUT_DIR) / "sql"
+    _all_cfg, _all_sql = _load_all_config_and_sql_metadata(
+        str(_CONFIGS_DIR_SEARCH.resolve()),
+        str(_SQL_DIR_SEARCH.resolve()),
+    )
+
+    _search_cfg_results = []
+    for meta in _all_cfg:
+        _name = (meta.get('name') or '').lower()
+        _desc = (meta.get('description') or '').lower()
+        _tags = ' '.join(meta.get('tags', []) or []).lower()
+        _human = (meta.get('human_name') or '').lower()
+        _fact = (meta.get('fact_table') or '').lower()
+        _vn = (meta.get('view_name') or '').lower()
+        _haystack = f"{_name} {_desc} {_tags} {_human} {_fact} {_vn}"
+        if search_query in _haystack:
+            _search_cfg_results.append(meta)
+
+    _search_sql_results = []
+    for meta in _all_sql:
+        _disp_name = (meta.get('name') or meta.get('human_name') or '').lower()
+        _cfg_nm = (meta.get('config_name') or '').lower()
+        _vn_sql = (meta.get('view_name') or '').lower()
+        _desc = (meta.get('description') or '').lower()
+        _tags = ' '.join(meta.get('tags', []) or []).lower()
+        _fact = (meta.get('fact_table') or '').lower()
+        _haystack = f"{_disp_name} {_cfg_nm} {_vn_sql} {_desc} {_tags} {_fact}"
+        if search_query in _haystack:
+            _search_sql_results.append(meta)
+
+    st.caption(f"Результаты поиска «{search_query}»: {len(_search_cfg_results)} конфигураций, {len(_search_sql_results)} SQL")
+
+    if _search_cfg_results:
+        with st.expander(f"📂 Конфигурации ({len(_search_cfg_results)})", expanded=True):
+            for j, scm in enumerate(_search_cfg_results):
+                _s_name = scm.get('name') or scm.get('human_name') or scm.get('fact_table', '?')
+                _s_tags = scm.get('tags', []) or []
+                _s_tags_str = ' '.join(f'[{t}]' for t in _s_tags) if _s_tags else ''
+                _s_saved = str(scm.get('saved_at', '?'))[:16].replace('T', ' ')
+                _s_desc_short = (scm.get('description') or '')[:80]
+                _s_label = f"{_s_name} | {_s_saved} {_s_tags_str}"
+                if _s_desc_short:
+                    _s_label += f" — {_s_desc_short}"
+
+                scol_load, scol_del = st.columns([5, 1])
+                with scol_load:
+                    if st.button(f"📌 {_s_label}", key=f"search_cfg_load_{j}", use_container_width=True):
+                        with open(scm['filepath'], 'r', encoding='utf-8') as f:
+                            full_data = json.load(f)
+                        td_list_load = full_data.get('metadata', {}).get('tables_detail', [])
+                        _missing_path = [
+                            t.get('table', '?') for t in td_list_load
+                            if t.get('role') != 'root' and 'path_from_root' not in t
+                        ]
+                        if _missing_path:
+                            st.error(
+                                f"⚠️ Конфигурация устарела (нет path_from_root). "
+                                f"Таблицы: {_missing_path[:5]}{'...' if len(_missing_path) > 5 else ''}"
+                            )
+                        else:
+                            loaded_tc = full_data.get('table_config', {})
+                            loaded_excl = full_data.get('excluded_fields', {})
+                            restored_excl = {}
+                            for k, v in loaded_excl.items():
+                                restored_excl[k] = set(v) if isinstance(v, list) else v
+                            st.session_state._pending_cfg_load = {
+                                'table_config': loaded_tc,
+                                'excluded_fields': restored_excl,
+                            }
+                            st.session_state.gen_table_config = loaded_tc
+                            st.session_state.gen_excluded_fields = restored_excl
+                            _apply_loaded_cfg_metadata_to_widgets(full_data)
+                            st.success("✅ Конфигурация загружена из поиска")
+                        st.rerun()
+                with scol_del:
+                    st.caption('')
+
+    if _search_sql_results:
+        with st.expander(f"📄 SQL-результаты ({len(_search_sql_results)})", expanded=True):
+            for j, ssm in enumerate(_search_sql_results):
+                _ss_name = ssm.get('human_name') or ssm.get('fact_table', '?')
+                _ss_tags = ssm.get('tags', []) or []
+                _ss_tags_str = ' '.join(f'[{t}]' for t in _ss_tags) if _ss_tags else ''
+                _ss_saved = str(ssm.get('saved_at', '?'))[:16].replace('T', ' ')
+                _ss_label = f"{_ss_name} | {ssm.get('sql_lines', '?')} строк | {_ss_saved} {_ss_tags_str}"
+                _sql_file = ssm.get('sql_file', '')
+                _sql_path = _SQL_DIR_SEARCH / _sql_file if _sql_file else None
+                if _sql_path and _sql_path.exists():
+                    _sql_content = _sql_path.read_text(encoding='utf-8')
+                    st.download_button(
+                        f"📥 {_ss_label}",
+                        data=_sql_content.encode('utf-8'),
+                        file_name=_sql_file or 'export.sql',
+                        mime='text/sql',
+                        key=f"search_sql_dl_{j}",
+                    )
+                else:
+                    st.caption(f"📄 {_ss_label} (файл не найден)")
+
+    if not _search_cfg_results and not _search_sql_results:
+        st.info(f"Ничего не найдено по запросу «{search_query}»")
 
 
 # ─── Персистентность состояния ─────────────────────────────────────────────
@@ -2407,227 +2655,311 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
     # ═══════════════════════════════════════════════════════════════════════
     # СЕКЦИЯ 7b: КОНФИГУРАЦИИ ПРОЕКТА (выбор/создание перед настройкой)
     # ═══════════════════════════════════════════════════════════════════════
-    st.header("9. 📂 Конфигурации проекта")
+    def _render_section9_project_configs_body():
+        
+        _CONFIGS_DIR_PRE = Path(config.DEFAULT_OUTPUT_DIR) / "configs"
+        _pre_selected_table_db = st.session_state.gen_fact_table_db
+        _pre_sp = st.session_state.gen_structure_parser
+        _pre_analyzer = st.session_state.gen_analyzer
+        _pre_relationships = st.session_state.gen_relationships_collected
+        
+        _pre_human_gt = _pre_sp.get_table_human_name(_pre_selected_table_db) or _pre_selected_table_db if _pre_sp else _pre_selected_table_db
+        _pre_current_graph_hash = st.session_state.get('gen_graph_hash')
+        _pre_md = st.session_state.get('gen_graph_max_depth') or st.session_state.get('gen_max_depth', '?')
+        _pre_mdu = st.session_state.get('gen_graph_max_depth_up') or st.session_state.get('gen_max_depth_up', '?')
+        
+        # Кнопка «Новая конфигурация»
+        if st.button("🆕 Новая конфигурация (сброс)", key="gen_new_cfg"):
+            tc_new = {}
+            for rel in _pre_relationships:
+                tc_new[rel['relationship_key']] = {'enabled': False, 'join_type': 'INNER JOIN'}
+            st.session_state.gen_table_config = tc_new
+            # Дефолт «все поля не выбраны»: excluded = {key: set(все колонки)} для корня и всех связей
+            excl_all = {}
+            nt_all = {}
+            _root_key = f"__root__{_pre_selected_table_db}"
+            _root_cols = _get_table_columns_cached(st.session_state.connection_string, _pre_selected_table_db)
+            excl_all[_root_key] = {c[0] for c in (_root_cols or [])}
+            nt_all[_root_key] = len(_root_cols or [])
+            for _rel in _pre_relationships:
+                _rk = _rel['relationship_key']
+                _dir = _rel.get('direction', 'forward')
+                _tbl = _rel['target_table'] if _dir == 'forward' else _rel['source_table']
+                _cols = _get_table_columns_cached(st.session_state.connection_string, _tbl)
+                excl_all[_rk] = {c[0] for c in (_cols or [])}
+                nt_all[_rk] = len(_cols or [])
+            st.session_state.gen_excluded_fields = excl_all
+            st.session_state.gen_rel_n_total = nt_all
+            st.session_state._pending_cfg_load = {
+                'table_config': tc_new,
+                'excluded_fields': excl_all,
+            }
+            st.rerun()
+        
+        # Список сохранённых конфигураций (кэш диска, см. _load_configs_for_graph)
+        _fact_norm_for_cache = _pre_analyzer._normalize_table_name(_pre_selected_table_db)
+        _pre_saved_configs = _load_configs_for_graph(
+            str(_CONFIGS_DIR_PRE.resolve()),
+            _pre_current_graph_hash,
+            _fact_norm_for_cache,
+            _pre_md,
+            _pre_mdu,
+        )
 
-    _CONFIGS_DIR_PRE = Path(config.DEFAULT_OUTPUT_DIR) / "configs"
-    _pre_selected_table_db = st.session_state.gen_fact_table_db
-    _pre_sp = st.session_state.gen_structure_parser
-    _pre_analyzer = st.session_state.gen_analyzer
-    _pre_relationships = st.session_state.gen_relationships_collected
+        if _pre_saved_configs:
+            _pre_n_rels = len(_pre_relationships)
+            _pre_hash_part = f" #{_pre_current_graph_hash[:8]}" if _pre_current_graph_hash else ""
+            _pre_graph_spec = f"{_pre_human_gt} | ↓{_pre_md} ↑{_pre_mdu} | {_pre_n_rels} связей{_pre_hash_part}"
+            with st.expander(f"📂 Сохранённые конфигурации для Графа связей {_pre_graph_spec} ({len(_pre_saved_configs)})", expanded=True):
+                for i, cm in enumerate(_pre_saved_configs):
+                    saved_at = cm.get('saved_at', '?')
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(saved_at)
+                        saved_display = dt.strftime("%d.%m.%Y %H:%M")
+                    except Exception:
+                        saved_display = saved_at
+        
+                    human = cm.get('human_name') or cm.get('fact_table', '?')
+                    sel_f = cm.get('selected_fields', '?')
+                    tot_f = cm.get('total_fields', '?')
+                    _cfg_title = (cm.get('name') or '').strip()
+                    _cfg_vn = (cm.get('view_name') or '').strip()
+                    _cfg_tags_list = cm.get('tags', []) or []
+                    _cfg_tags_short = ' '.join(f'[{t}]' for t in _cfg_tags_list[:5])
+                    if len(_cfg_tags_list) > 5:
+                        _cfg_tags_short += '…'
+                    _d_full = (cm.get('description') or '').strip()
+                    if len(_d_full) > 60:
+                        _desc_for_label = f" — {_d_full[:60]}…"
+                    elif _d_full:
+                        _desc_for_label = f" — {_d_full}"
+                    else:
+                        _desc_for_label = ""
+                    label = (
+                        f"{_cfg_title + ' — ' if _cfg_title else ''}"
+                        f"{human}"
+                        f"{f' | VIEW `{_cfg_vn}`' if _cfg_vn else ''} | "
+                        f"↓{cm.get('max_depth', '?')} ↑{cm.get('max_depth_up', '?')} | "
+                        f"таблиц: {cm.get('active_tables', '?')}/{cm.get('total_tables', '?')} | "
+                        f"полей: {sel_f}/{tot_f} | "
+                        f"{saved_display}"
+                        f"{(' ' + _cfg_tags_short) if _cfg_tags_short else ''}"
+                        f"{_desc_for_label}"
+                    )
 
-    _pre_human_gt = _pre_sp.get_table_human_name(_pre_selected_table_db) or _pre_selected_table_db if _pre_sp else _pre_selected_table_db
-    _pre_current_graph_hash = st.session_state.get('gen_graph_hash')
-    _pre_md = st.session_state.get('gen_graph_max_depth') or st.session_state.get('gen_max_depth', '?')
-    _pre_mdu = st.session_state.get('gen_graph_max_depth_up') or st.session_state.get('gen_max_depth_up', '?')
+                    edit_key = f"_pre_cfg_edit_{i}"
+                    col_load, col_edit, col_info, col_del = st.columns([4, 1, 1, 1])
+                    with col_load:
+                        if st.button(f"📌 {label}", key=f"pre_cfg_load_{i}", use_container_width=True):
+                            with open(cm['filepath'], 'r', encoding='utf-8') as f:
+                                full_data = json.load(f)
+                            td_list_load = full_data.get('metadata', {}).get('tables_detail', [])
+                            # Проверка path_from_root: у всех таблиц кроме root должен быть путь
+                            _missing_path = [t.get('table', '?') for t in td_list_load if t.get('role') != 'root' and 'path_from_root' not in t]
+                            if _missing_path:
+                                st.error(
+                                    f"⚠️ Конфигурация устарела: отсутствует path_from_root у таблиц {_missing_path[:5]}{'...' if len(_missing_path) > 5 else ''}. "
+                                    "Удалите старые конфигурации и сохраните заново."
+                                )
+                            else:
+                                loaded_tc = full_data.get('table_config', {})
+                                loaded_excl = full_data.get('excluded_fields', {})
+                                restored_excl = {}
+                                for k, v in loaded_excl.items():
+                                    restored_excl[k] = set(v) if isinstance(v, list) else v
+                                st.session_state._pending_cfg_load = {
+                                    'table_config': loaded_tc,
+                                    'excluded_fields': restored_excl,
+                                }
+                                st.session_state.gen_table_config = loaded_tc
+                                st.session_state.gen_excluded_fields = restored_excl
+                                _apply_loaded_cfg_metadata_to_widgets(full_data)
+                                st.success(f"✅ Конфигурация загружена: {cm.get('active_tables', '?')} таблиц, {sel_f} полей")
+                            st.rerun()
+                    with col_edit:
+                        if st.button("✏️", key=f"pre_cfg_edit_btn_{i}", help="Редактировать метаданные (name, VIEW, описание, теги)"):
+                            # Без st.rerun: Streamlit и так перезапустит скрипт; двойной rerun грузил всю страницу.
+                            st.session_state[edit_key] = not st.session_state.get(edit_key, False)
+                    with col_info:
+                        detail_key = f"_pre_cfg_detail_{i}"
+                        if st.button("📊", key=f"pre_cfg_info_{i}", help="Показать детали"):
+                            st.session_state[detail_key] = not st.session_state.get(detail_key, False)
+                    with col_del:
+                        if st.button("🗑️", key=f"pre_cfg_del_{i}"):
+                            try:
+                                Path(cm['filepath']).unlink()
+                            except Exception:
+                                pass
+                            _invalidate_project_config_metadata_caches()
+                            st.rerun()
 
-    # Кнопка «Новая конфигурация»
-    if st.button("🆕 Новая конфигурация (сброс)", key="gen_new_cfg"):
-        tc_new = {}
-        for rel in _pre_relationships:
-            tc_new[rel['relationship_key']] = {'enabled': False, 'join_type': 'INNER JOIN'}
-        st.session_state.gen_table_config = tc_new
-        # Дефолт «все поля не выбраны»: excluded = {key: set(все колонки)} для корня и всех связей
-        excl_all = {}
-        nt_all = {}
-        _root_key = f"__root__{_pre_selected_table_db}"
-        _root_cols = _get_table_columns_cached(st.session_state.connection_string, _pre_selected_table_db)
-        excl_all[_root_key] = {c[0] for c in (_root_cols or [])}
-        nt_all[_root_key] = len(_root_cols or [])
-        for _rel in _pre_relationships:
-            _rk = _rel['relationship_key']
-            _dir = _rel.get('direction', 'forward')
-            _tbl = _rel['target_table'] if _dir == 'forward' else _rel['source_table']
-            _cols = _get_table_columns_cached(st.session_state.connection_string, _tbl)
-            excl_all[_rk] = {c[0] for c in (_cols or [])}
-            nt_all[_rk] = len(_cols or [])
-        st.session_state.gen_excluded_fields = excl_all
-        st.session_state.gen_rel_n_total = nt_all
-        st.session_state._pending_cfg_load = {
-            'table_config': tc_new,
-            'excluded_fields': excl_all,
-        }
-        st.rerun()
-
-    # Список сохранённых конфигураций
-    _pre_saved_configs = []
-    if _CONFIGS_DIR_PRE.exists():
-        for fp in sorted(_CONFIGS_DIR_PRE.glob("cfg_*.json"), reverse=True):
-            try:
-                with open(fp, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                meta = data.get('metadata', {})
-                cfg_fact = meta.get('fact_table', '')
-                if not cfg_fact:
-                    continue
-                cfg_graph_hash = meta.get('graph_hash')
-                if _pre_current_graph_hash and cfg_graph_hash:
-                    if cfg_graph_hash != _pre_current_graph_hash:
-                        continue
-                else:
-                    cfg_norm = _pre_analyzer._normalize_table_name(cfg_fact)
-                    sel_norm = _pre_analyzer._normalize_table_name(_pre_selected_table_db)
-                    if cfg_norm != sel_norm:
-                        continue
-                    if meta.get('max_depth') != _pre_md or meta.get('max_depth_up') != _pre_mdu:
-                        continue
-                meta['filename'] = fp.name
-                meta['filepath'] = str(fp)
-                _pre_saved_configs.append(meta)
-            except Exception:
-                continue
-
-    if _pre_saved_configs:
-        _pre_n_rels = len(_pre_relationships)
-        _pre_hash_part = f" #{_pre_current_graph_hash[:8]}" if _pre_current_graph_hash else ""
-        _pre_graph_spec = f"{_pre_human_gt} | ↓{_pre_md} ↑{_pre_mdu} | {_pre_n_rels} связей{_pre_hash_part}"
-        with st.expander(f"📂 Сохранённые конфигурации для Графа связей {_pre_graph_spec} ({len(_pre_saved_configs)})", expanded=True):
-            for i, cm in enumerate(_pre_saved_configs):
-                saved_at = cm.get('saved_at', '?')
-                try:
-                    from datetime import datetime
-                    dt = datetime.fromisoformat(saved_at)
-                    saved_display = dt.strftime("%d.%m.%Y %H:%M")
-                except Exception:
-                    saved_display = saved_at
-
-                human = cm.get('human_name') or cm.get('fact_table', '?')
-                sel_f = cm.get('selected_fields', '?')
-                tot_f = cm.get('total_fields', '?')
-                label = (
-                    f"{human} | "
-                    f"↓{cm.get('max_depth', '?')} ↑{cm.get('max_depth_up', '?')} | "
-                    f"таблиц: {cm.get('active_tables', '?')}/{cm.get('total_tables', '?')} | "
-                    f"полей: {sel_f}/{tot_f} | "
-                    f"{saved_display}"
-                )
-
-                col_load, col_info, col_del = st.columns([4, 1, 1])
-                with col_load:
-                    if st.button(f"📌 {label}", key=f"pre_cfg_load_{i}", use_container_width=True):
-                        with open(cm['filepath'], 'r', encoding='utf-8') as f:
-                            full_data = json.load(f)
-                        td_list_load = full_data.get('metadata', {}).get('tables_detail', [])
-                        # Проверка path_from_root: у всех таблиц кроме root должен быть путь
-                        _missing_path = [t.get('table', '?') for t in td_list_load if t.get('role') != 'root' and 'path_from_root' not in t]
-                        if _missing_path:
-                            st.error(
-                                f"⚠️ Конфигурация устарела: отсутствует path_from_root у таблиц {_missing_path[:5]}{'...' if len(_missing_path) > 5 else ''}. "
-                                "Удалите старые конфигурации и сохраните заново."
+                    # Inline-редактирование только metadata (без table_config / excluded_fields)
+                    if st.session_state.get(edit_key, False):
+                        st.caption("**✏️ Метаданные этого JSON** (имя, VIEW, описание, теги)")
+                        _fp_meta = cm['filepath']
+                        with st.form(key=f"pre_cfg_meta_form_{i}"):
+                            _fm_name = st.text_input(
+                                "Название конфигурации",
+                                value=str(cm.get('name') or ''),
+                                key=f"pre_cfg_form_name_{i}",
                             )
-                        else:
-                            loaded_tc = full_data.get('table_config', {})
-                            loaded_excl = full_data.get('excluded_fields', {})
-                            restored_excl = {}
-                            for k, v in loaded_excl.items():
-                                restored_excl[k] = set(v) if isinstance(v, list) else v
-                            st.session_state._pending_cfg_load = {
-                                'table_config': loaded_tc,
-                                'excluded_fields': restored_excl,
-                            }
-                            st.session_state.gen_table_config = loaded_tc
-                            st.session_state.gen_excluded_fields = restored_excl
-                            st.success(f"✅ Конфигурация загружена: {cm.get('active_tables', '?')} таблиц, {sel_f} полей")
-                        st.rerun()
-                with col_info:
-                    detail_key = f"_pre_cfg_detail_{i}"
-                    if st.button("📊", key=f"pre_cfg_info_{i}", help="Показать детали"):
-                        st.session_state[detail_key] = not st.session_state.get(detail_key, False)
-                        st.rerun()
-                with col_del:
-                    if st.button("🗑️", key=f"pre_cfg_del_{i}"):
+                            _fm_vn = st.text_input(
+                                "Имя VIEW",
+                                value=str(cm.get('view_name') or ''),
+                                key=f"pre_cfg_form_vn_{i}",
+                            )
+                            _fm_desc = st.text_area(
+                                "Описание",
+                                value=str(cm.get('description') or ''),
+                                key=f"pre_cfg_form_desc_{i}",
+                                height=72,
+                            )
+                            _tags_joined = (
+                                ", ".join(cm.get("tags", []))
+                                if isinstance(cm.get("tags"), list)
+                                else str(cm.get("tags") or "")
+                            )
+                            _fm_tags = st.text_input(
+                                "Теги через запятую",
+                                value=_tags_joined,
+                                key=f"pre_cfg_form_tags_{i}",
+                            )
+                            _sub_meta = st.form_submit_button("💾 Записать метаданные в файл")
+                        if _sub_meta:
+                            _vn_st = (_fm_vn or "").strip()
+                            if _vn_st and not _cfg_view_name_chars_valid(_vn_st):
+                                st.error("Имя VIEW: только буквы (Unicode), цифры и _. Исправьте и сохраните снова.")
+                            else:
+                                try:
+                                    with open(_fp_meta, "r", encoding="utf-8") as _f:
+                                        _data_m = json.load(_f)
+                                    _md = _data_m.get("metadata", {}) or {}
+                                    _md["name"] = (_fm_name or "").strip()
+                                    _md["view_name"] = _vn_st
+                                    _md["description"] = (_fm_desc or "").strip()
+                                    _md["tags"] = _parse_cfg_tags_csv(_fm_tags or "")
+                                    _data_m["metadata"] = _md
+                                    with open(_fp_meta, "w", encoding="utf-8") as _f:
+                                        json.dump(_data_m, _f, ensure_ascii=False, indent=2)
+                                    st.session_state[edit_key] = False
+                                    st.success("Метаданные обновлены.")
+                                    _invalidate_project_config_metadata_caches()
+                                    st.rerun()
+                                except Exception as _e_m:
+                                    st.error(f"Ошибка записи JSON: {_e_m}")
+
+                    if st.session_state.get(detail_key, False):
+                        # Загружаем полный файл — table_config в корне, tables_detail в metadata
+                        _full_data = {}
                         try:
-                            Path(cm['filepath']).unlink()
+                            with open(cm['filepath'], 'r', encoding='utf-8') as _f:
+                                _full_data = json.load(_f)
                         except Exception:
                             pass
-                        st.rerun()
-
-                if st.session_state.get(detail_key, False):
-                    # Загружаем полный файл — table_config в корне, tables_detail в metadata
-                    _full_data = {}
-                    try:
-                        with open(cm['filepath'], 'r', encoding='utf-8') as _f:
-                            _full_data = json.load(_f)
-                    except Exception:
-                        pass
-                    _cfg_edges = cm.get('edges', []) or (_full_data.get('metadata', {}) or {}).get('edges', [])
-                    td_list = cm.get('tables_detail', []) or (_full_data.get('metadata', {}) or {}).get('tables_detail', [])
-                    st.caption("**Таблицы и выбранные поля:**")
-                    for _td in td_list:
-                        _sel_names = _td.get('selected_field_names', [])
-                        if not _sel_names:
-                            continue
-                        _t_human = _td.get('human_name') or _td.get('table', '?')
-                        _t_tbl = _td.get('table', '?')
-                        st.markdown(f"- **{_t_human}** (`{_t_tbl}`): {', '.join(_sel_names)}")
-                    st.markdown("---")
-                    if _cfg_edges:
-                        _root_table = cm.get('fact_table', '')
-                        _root_human = cm.get('human_name') or _root_table
-                        _root_td = next((t for t in td_list if t.get('role') == 'root'), None)
-                        _root_sel = _root_td.get('selected_fields', '?') if _root_td else '?'
-                        _root_tot = _root_td.get('total_fields', '?') if _root_td else '?'
-                        st.markdown(f"⭐ **{_root_human}** (`{_root_table}`) — полей: {_root_sel}/{_root_tot}")
-                        _children_by_source = {}
-                        for _e in _cfg_edges:
-                            _dir = _e.get('direction', 'forward')
-                            _parent = _e['source'] if _dir == 'forward' else _e['target']
-                            _children_by_source.setdefault(_parent, []).append(_e)
-                        _visited_edges = set()
-                        def _render_tree_pre(parent_table, indent_level):
-                            for _e in _children_by_source.get(parent_table, []):
-                                _ek = _e.get('relationship_key', '')
-                                if _ek in _visited_edges:
-                                    continue
-                                _visited_edges.add(_ek)
+                        _cfg_edges = cm.get('edges', []) or (_full_data.get('metadata', {}) or {}).get('edges', [])
+                        td_list = cm.get('tables_detail', []) or (_full_data.get('metadata', {}) or {}).get('tables_detail', [])
+                        st.caption("**Таблицы и выбранные поля:**")
+                        for _td in td_list:
+                            _sel_names = _td.get('selected_field_names', [])
+                            if not _sel_names:
+                                continue
+                            _t_human = _td.get('human_name') or _td.get('table', '?')
+                            _t_tbl = _td.get('table', '?')
+                            st.markdown(f"- **{_t_human}** (`{_t_tbl}`): {', '.join(_sel_names)}")
+                        st.markdown("---")
+                        if _cfg_edges:
+                            _root_table = cm.get('fact_table', '')
+                            _root_human = cm.get('human_name') or _root_table
+                            _root_td = next((t for t in td_list if t.get('role') == 'root'), None)
+                            _root_sel = _root_td.get('selected_fields', '?') if _root_td else '?'
+                            _root_tot = _root_td.get('total_fields', '?') if _root_td else '?'
+                            st.markdown(f"⭐ **{_root_human}** (`{_root_table}`) — полей: {_root_sel}/{_root_tot}")
+                            _children_by_source = {}
+                            for _e in _cfg_edges:
                                 _dir = _e.get('direction', 'forward')
-                                _dir_icon = "↑" if _dir == 'reverse' else "↓"
-                                _child = _e['target'] if _dir == 'forward' else _e['source']
-                                _child_human = (_e.get('target_human') if _dir == 'forward' else _e.get('source_human')) or _child
-                                _field = _e.get('field_name', '?')
-                                _jt = _e.get('join_type', '')
-                                _depth = _e.get('depth', '')
-                                _sel = _e.get('selected_fields', '?')
-                                _tot = _e.get('total_fields', '?')
-                                _indent = "&nbsp;" * (indent_level * 4)
-                                st.markdown(
-                                    f"{_indent}{_dir_icon} --[`{_field}`]--> "
-                                    f"**{_child_human}** (`{_child}`) "
-                                    f"d={_depth} {_jt} — полей: {_sel}/{_tot}"
-                                )
-                                _render_tree_pre(_child, indent_level + 1)
-                        _render_tree_pre(_root_table, 1)
-                    elif td_list:
-                        for td in td_list:
-                            role_icon = "⭐" if td.get('role') == 'root' else ("↑" if td.get('role') == 'reverse' else "↓")
-                            t_human = td.get('human_name') or td.get('table', '?')
-                            t_sel = td.get('selected_fields', 0)
-                            t_tot = td.get('total_fields', 0)
-                            st.caption(f"{role_icon} **{t_human}** ({td.get('table', '?')}) — полей: {t_sel}/{t_tot}")
-                    st.markdown("---")
-    else:
-        st.info("ℹ️ Нет сохранённых конфигураций. Настройте таблицы и поля ниже, затем сохраните конфигурацию.")
+                                _parent = _e['source'] if _dir == 'forward' else _e['target']
+                                _children_by_source.setdefault(_parent, []).append(_e)
+                            _visited_edges = set()
+                            def _render_tree_pre(parent_table, indent_level):
+                                for _e in _children_by_source.get(parent_table, []):
+                                    _ek = _e.get('relationship_key', '')
+                                    if _ek in _visited_edges:
+                                        continue
+                                    _visited_edges.add(_ek)
+                                    _dir = _e.get('direction', 'forward')
+                                    _dir_icon = "↑" if _dir == 'reverse' else "↓"
+                                    _child = _e['target'] if _dir == 'forward' else _e['source']
+                                    _child_human = (_e.get('target_human') if _dir == 'forward' else _e.get('source_human')) or _child
+                                    _field = _e.get('field_name', '?')
+                                    _jt = _e.get('join_type', '')
+                                    _depth = _e.get('depth', '')
+                                    _sel = _e.get('selected_fields', '?')
+                                    _tot = _e.get('total_fields', '?')
+                                    _indent = "&nbsp;" * (indent_level * 4)
+                                    st.markdown(
+                                        f"{_indent}{_dir_icon} --[`{_field}`]--> "
+                                        f"**{_child_human}** (`{_child}`) "
+                                        f"d={_depth} {_jt} — полей: {_sel}/{_tot}"
+                                    )
+                                    _render_tree_pre(_child, indent_level + 1)
+                            _render_tree_pre(_root_table, 1)
+                        elif td_list:
+                            for td in td_list:
+                                role_icon = "⭐" if td.get('role') == 'root' else ("↑" if td.get('role') == 'reverse' else "↓")
+                                t_human = td.get('human_name') or td.get('table', '?')
+                                t_sel = td.get('selected_fields', 0)
+                                t_tot = td.get('total_fields', 0)
+                                st.caption(f"{role_icon} **{t_human}** ({td.get('table', '?')}) — полей: {t_sel}/{t_tot}")
+                        st.markdown("---")
+        else:
+            st.info("ℹ️ Нет сохранённых конфигураций. Настройте таблицы и поля ниже, затем сохраните конфигурацию.")
+        
+        # Также поддерживаем старые файлы config_*.json (обратная совместимость)
+        _pre_old_configs = list(Path(config.DEFAULT_OUTPUT_DIR).glob("config_*.json")) if Path(config.DEFAULT_OUTPUT_DIR).exists() else []
+        if _pre_old_configs:
+            with st.expander(f"📁 Старые конфигурации ({len(_pre_old_configs)})", expanded=False):
+                for oc in _pre_old_configs:
+                    col_l, col_d = st.columns([5, 1])
+                    with col_l:
+                        if st.button(f"📄 {oc.name}", key=f"pre_old_cfg_{oc.name}", use_container_width=True):
+                            with open(oc, 'r', encoding='utf-8') as f:
+                                old_data = json.load(f)
+                            st.session_state.gen_table_config = old_data.get('table_config', {})
+                            st.session_state._pending_cfg_load = {
+                                'table_config': old_data.get('table_config', {}),
+                                'excluded_fields': {},
+                            }
+                            st.success(f"✅ Загружена старая конфигурация: `{oc.name}`")
+                            st.rerun()
+                    with col_d:
+                        if st.button("🗑️", key=f"pre_old_del_{oc.name}"):
+                            oc.unlink(missing_ok=True)
+                            st.rerun()
 
-    # Также поддерживаем старые файлы config_*.json (обратная совместимость)
-    _pre_old_configs = list(Path(config.DEFAULT_OUTPUT_DIR).glob("config_*.json")) if Path(config.DEFAULT_OUTPUT_DIR).exists() else []
-    if _pre_old_configs:
-        with st.expander(f"📁 Старые конфигурации ({len(_pre_old_configs)})", expanded=False):
-            for oc in _pre_old_configs:
-                col_l, col_d = st.columns([5, 1])
-                with col_l:
-                    if st.button(f"📄 {oc.name}", key=f"pre_old_cfg_{oc.name}", use_container_width=True):
-                        with open(oc, 'r', encoding='utf-8') as f:
-                            old_data = json.load(f)
-                        st.session_state.gen_table_config = old_data.get('table_config', {})
-                        st.session_state._pending_cfg_load = {
-                            'table_config': old_data.get('table_config', {}),
-                            'excluded_fields': {},
-                        }
-                        st.success(f"✅ Загружена старая конфигурация: `{oc.name}`")
-                        st.rerun()
-                with col_d:
-                    if st.button("🗑️", key=f"pre_old_del_{oc.name}"):
-                        oc.unlink(missing_ok=True)
-                        st.rerun()
+    def _render_section9_fragment_inner():
+        """
+        Заголовок, поиск и тело секции 9. В st.fragment — взаимодействие ✏️/📊/поиск
+        перезапускает только этот блок, без секции 10 и шагов 1–8.
+        """
+        st.header("9. 📂 Конфигурации проекта")
+        _cfg_gs_raw = st.text_input(
+            "🔍 Поиск по названию, описанию, тегам...",
+            value="",
+            key="_cfg_global_search",
+            help="По всем cfg_*.json и sql_*.json без фильтра по текущему графу",
+        )
+        _cfg_gs = _cfg_gs_raw.strip().lower()
+        if _cfg_gs:
+            _render_cfg_sql_global_search(_cfg_gs)
+        else:
+            _render_section9_project_configs_body()
+
+    # Без API fragment — полный rerun как раньше (старые версии Streamlit).
+    _run_section9 = _render_section9_fragment_inner
+    if _USE_FRAGMENT:
+        _run_section9 = st.fragment(_render_section9_fragment_inner)
+    _run_section9()
 
     st.markdown("---")
 
@@ -2683,6 +3015,41 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
     # ─── Сохранение и визуализация ───────────────────────────────────────
     _col_save, _col_viz = st.columns(2)
     with _col_save:
+        # Метаданные для JSON и для секции SQL (имя VIEW, описание, теги)
+        _human_fact_save = sp.get_table_human_name(selected_table_db) if sp else None
+        _auto_name = (_human_fact_save or selected_table_db).strip() or selected_table_db
+        _base_vn = re.sub(
+            r"[^\w]",
+            "_",
+            (_human_fact_save or selected_table_db).replace(" ", "_"),
+            flags=re.UNICODE,
+        )
+        if not (_base_vn or "").strip("_"):
+            _base_vn = re.sub(r"[^\w]", "_", selected_table_db, flags=re.UNICODE)
+        _auto_vn = ("vw_" + _base_vn.lstrip("_"))[:120]
+        if "_cfg_save_name" not in st.session_state:
+            st.session_state["_cfg_save_name"] = _auto_name
+        if "_cfg_save_view_name" not in st.session_state:
+            st.session_state["_cfg_save_view_name"] = _auto_vn
+        if "_cfg_save_description" not in st.session_state:
+            st.session_state["_cfg_save_description"] = ""
+        if "_cfg_save_tags" not in st.session_state:
+            st.session_state["_cfg_save_tags"] = ""
+
+        st.caption("Метаданные при сохранении cfg и при генерации SQL:")
+        st.text_input("Название конфигурации", key="_cfg_save_name")
+        _vn_widget = st.text_input(
+            "Имя VIEW (буквы Unicode, цифры, _)",
+            key="_cfg_save_view_name",
+            help="Используется в CREATE VIEW и в имени файла cfg при непустом корректном значении",
+        )
+        st.text_area("Описание", key="_cfg_save_description", height=70)
+        st.text_input("Теги через запятую", key="_cfg_save_tags", placeholder="отчёт, продажи")
+
+        _vn_strip = (_vn_widget or "").strip()
+        if _vn_strip and not _cfg_view_name_chars_valid(_vn_strip):
+            st.warning("⚠️ Имя VIEW некорректно — сохранение cfg и генерация SQL с этим именем будут заблокированы.")
+
         if st.button("💾 Сохранить текущую конфигурацию", type="primary", key="gen_save_cfg"):
             from datetime import datetime
             _CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2711,11 +3078,24 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                     except Exception:
                         continue
 
-            if not _is_duplicate:
+            _save_name_m = st.session_state.get("_cfg_save_name", "").strip()
+            _save_vn_m = st.session_state.get("_cfg_save_view_name", "").strip()
+            _save_desc_m = st.session_state.get("_cfg_save_description", "").strip()
+            _save_tags_m = _parse_cfg_tags_csv(st.session_state.get("_cfg_save_tags", ""))
+
+            if not _is_duplicate and _save_vn_m and not _cfg_view_name_chars_valid(_save_vn_m):
+                st.error("Исправьте имя VIEW или оставьте его пустым — сохранение отменено.")
+
+            if not _is_duplicate and (not _save_vn_m or _cfg_view_name_chars_valid(_save_vn_m)):
                 _rel_key_to_path_save = st.session_state.get('gen_rel_key_to_path') or {}
                 _rk_to_rel_save = {r['relationship_key']: r for r in relationships}
 
-                filename = f"cfg_{safe_name}_{ts.strftime('%Y%m%d_%H%M%S')}.json"
+                # Имя файла: из санитизированного view_name, иначе как раньше — по таблице
+                if _save_vn_m:
+                    _vn_for_fn = re.sub(r"[^\w]", "_", _save_vn_m, flags=re.UNICODE)
+                    filename = f"cfg_{_vn_for_fn}_{ts.strftime('%Y%m%d_%H%M%S')}.json"
+                else:
+                    filename = f"cfg_{safe_name}_{ts.strftime('%Y%m%d_%H%M%S')}.json"
 
                 # Собираем детали по каждой таблице, включая корневую и транзитные
                 _total_fields = 0
@@ -2858,6 +3238,10 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
 
                 config_data = {
                     'metadata': {
+                        'name': _save_name_m,
+                        'view_name': _save_vn_m,
+                        'description': _save_desc_m,
+                        'tags': _save_tags_m,
                         'fact_table': selected_table_db,
                         'human_name': sp.get_table_human_name(selected_table_db) if sp else None,
                         'max_depth': max_depth,
@@ -2881,6 +3265,7 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                 with open(_CONFIGS_DIR / filename, 'w', encoding='utf-8') as f:
                     json.dump(config_data, f, ensure_ascii=False, indent=2)
                 st.success(f"✅ Конфигурация сохранена: `{filename}`")
+                _invalidate_project_config_metadata_caches()
     with _col_viz:
         if st.button("🖼️ Визуализировать конфигурацию", key="gen_viz_config"):
             with st.spinner("Отрисовка графа конфигурации..."):
@@ -2933,65 +3318,113 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                         for _root in _roots:
                             _dfs(_root, [], {_root, _vn(_root)})
 
-                        for _rel in relationships:
-                            _rk = _rel['relationship_key']
-                            if _rk not in _rk_to_path:
-                                _rk_to_path[_rk] = [_rk]
-                                _ordered.append(_rel)
+                        # Не подмешиваем все relationships — иначе граф раздувается (план config_graph_viz_filter).
 
                         return _ordered, _rk_to_path
 
                     _viz_sorted_rels, _viz_rel_key_to_path = _build_viz_paths()
 
-                    _enabled_rks = {
-                        rk for rk, cfg in table_config.items()
-                        if cfg.get('enabled')
-                    }
-                    _effective_rks = set(_enabled_rks)
-                    for _rk in _enabled_rks:
-                        for _path_rk in _viz_rel_key_to_path.get(_rk, [_rk]):
-                            _effective_rks.add(_path_rk)
-                    _transit_rks = _effective_rks - _enabled_rks
-                    _config_rels = [r for r in _viz_sorted_rels if r['relationship_key'] in _effective_rks]
-                    viz_dir = Path(config.DEFAULT_OUTPUT_DIR) / "visualizations"
-                    viz_dir.mkdir(parents=True, exist_ok=True)
-                    from datetime import datetime as _dt_viz
-                    _ts = _dt_viz.now().strftime('%Y%m%d_%H%M%S')
-                    _safe = selected_table_db.replace('.', '_').replace(' ', '_').lstrip('_')
-                    viz_path = viz_dir / f"config_{_safe}_{_ts}.jpg"
-                    human_fact = sp.get_table_human_name(selected_table_db) if sp else None
-                    cfg_title = f"Конфигурация: {human_fact or selected_table_db}"
-                    # Подсчёт полей по таблицам
-                    _root_key = f"__root__{selected_table_db}"
-                    _root_cols = _get_table_columns_cached(st.session_state.connection_string, selected_table_db)
-                    _node_counts = {}
-                    if _root_cols:
-                        _n_root = len(_root_cols)
-                        _excl_root = len(excluded_fields.get(_root_key, set()))
-                        _node_counts[selected_table_db] = (_n_root - _excl_root, _n_root)
-                    for rel in _config_rels:
-                        _dir = rel.get('direction', 'forward')
-                        _tbl = rel['target_table'] if _dir == 'forward' else rel['source_table']
-                        if _tbl not in _node_counts:
-                            _cols = _get_table_columns_cached(st.session_state.connection_string, _tbl)
-                            if _cols:
-                                _n = len(_cols)
-                                if rel['relationship_key'] in _transit_rks:
-                                    _node_counts[_tbl] = (0, _n)
-                                else:
-                                    _excl = len(excluded_fields.get(rel['relationship_key'], set()))
-                                    _node_counts[_tbl] = (_n - _excl, _n)
-                    render_relationship_graph(
-                        relationships=_config_rels,
-                        fact_table=selected_table_db,
-                        output_path=str(viz_path),
-                        title=cfg_title,
-                        structure_parser=sp,
-                        dpi=150,
-                        node_field_counts=_node_counts
+                    # Таблицы с хотя бы одним выбранным полем (корень + стороны включённых связей).
+                    _vn_cfg = _an._normalize_table_name
+                    _root_key_viz = f"__root__{selected_table_db}"
+                    _root_cols_viz = _get_table_columns_cached(
+                        st.session_state.connection_string, selected_table_db
                     )
-                    st.session_state['_config_viz_path'] = str(viz_path)
-                    st.success(f"✅ Граф конфигурации сохранён: `{viz_path.name}`")
+                    _tables_with_selected = set()
+                    if _root_cols_viz:
+                        _nr = len(_root_cols_viz)
+                        _xr = len(excluded_fields.get(_root_key_viz, set()))
+                        if _nr - _xr > 0:
+                            _tables_with_selected.add(selected_table_db)
+                            _tables_with_selected.add(_vn_cfg(selected_table_db))
+
+                    _leaf_rks = set()
+                    for _rel in relationships:
+                        _rk = _rel['relationship_key']
+                        if not table_config.get(_rk, {}).get('enabled'):
+                            continue
+                        _d = _rel.get('direction', 'forward')
+                        _ch = _rel['target_table'] if _d == 'forward' else _rel['source_table']
+                        _cols_ch = _get_table_columns_cached(
+                            st.session_state.connection_string, _ch
+                        )
+                        if not _cols_ch:
+                            continue
+                        _nch = len(_cols_ch)
+                        _xch = len(excluded_fields.get(_rk, set()))
+                        if _nch - _xch > 0:
+                            _leaf_rks.add(_rk)
+                            _tables_with_selected.add(_ch)
+                            _tables_with_selected.add(_vn_cfg(_ch))
+
+                    if not _tables_with_selected:
+                        st.warning(
+                            "Нет таблиц с выбранными полями — нечего показать на графе. "
+                            "Включите хотя бы одно поле у корня или у присоединённой таблицы."
+                        )
+                    else:
+                        # Объединение путей от корня до каждой «листвы» с выбранными полями (транзит по рёбрам пути).
+                        _ui_paths_cfg = st.session_state.get('gen_rel_key_to_path') or {}
+                        _viz_rk_order = []
+                        _viz_rk_seen = set()
+                        for _rk_leaf in sorted(_leaf_rks):
+                            _path_use = _ui_paths_cfg.get(_rk_leaf) or _viz_rel_key_to_path.get(
+                                _rk_leaf, [_rk_leaf]
+                            )
+                            for _prk in _path_use:
+                                if _prk not in _viz_rk_seen:
+                                    _viz_rk_seen.add(_prk)
+                                    _viz_rk_order.append(_prk)
+                        _viz_rks = set(_viz_rk_order)
+
+                        _transit_rks = _viz_rks - _leaf_rks
+                        _rk_to_rel_cfg = {r['relationship_key']: r for r in relationships}
+                        _config_rels = [
+                            _rk_to_rel_cfg[rk] for rk in _viz_rk_order if rk in _rk_to_rel_cfg
+                        ]
+                        viz_dir = Path(config.DEFAULT_OUTPUT_DIR) / "visualizations"
+                        viz_dir.mkdir(parents=True, exist_ok=True)
+                        from datetime import datetime as _dt_viz
+                        _ts = _dt_viz.now().strftime('%Y%m%d_%H%M%S')
+                        _safe = selected_table_db.replace('.', '_').replace(' ', '_').lstrip('_')
+                        viz_path = viz_dir / f"config_{_safe}_{_ts}.jpg"
+                        human_fact = sp.get_table_human_name(selected_table_db) if sp else None
+                        cfg_title = f"Конфигурация: {human_fact or selected_table_db}"
+                        # Подсчёт полей только для узлов графа (корень + таблицы из отобранных рёбер).
+                        _root_key = f"__root__{selected_table_db}"
+                        _root_cols = _get_table_columns_cached(
+                            st.session_state.connection_string, selected_table_db
+                        )
+                        _node_counts = {}
+                        if _root_cols:
+                            _n_root = len(_root_cols)
+                            _excl_root = len(excluded_fields.get(_root_key, set()))
+                            _node_counts[selected_table_db] = (_n_root - _excl_root, _n_root)
+                        for rel in _config_rels:
+                            _dir = rel.get('direction', 'forward')
+                            _tbl = rel['target_table'] if _dir == 'forward' else rel['source_table']
+                            if _tbl not in _node_counts:
+                                _cols = _get_table_columns_cached(
+                                    st.session_state.connection_string, _tbl
+                                )
+                                if _cols:
+                                    _n = len(_cols)
+                                    if rel['relationship_key'] in _transit_rks:
+                                        _node_counts[_tbl] = (0, _n)
+                                    else:
+                                        _excl = len(excluded_fields.get(rel['relationship_key'], set()))
+                                        _node_counts[_tbl] = (_n - _excl, _n)
+                        render_relationship_graph(
+                            relationships=_config_rels,
+                            fact_table=selected_table_db,
+                            output_path=str(viz_path),
+                            title=cfg_title,
+                            structure_parser=sp,
+                            dpi=150,
+                            node_field_counts=_node_counts
+                        )
+                        st.session_state['_config_viz_path'] = str(viz_path)
+                        st.success(f"✅ Граф конфигурации сохранён: `{viz_path.name}`")
                 except Exception as e:
                     st.error(f"❌ Ошибка визуализации: {e}")
 
@@ -3026,7 +3459,11 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
         output_format_code = fmt_map[output_format]
     with col2:
         human_fact = sp.get_table_human_name(selected_table_db)
-        default_filename = f"vw_{human_fact or selected_table_db.lstrip('_')}.sql".replace('.', '_').replace(' ', '_')
+        _sql_out_vn = (st.session_state.get('_cfg_save_view_name') or '').strip()
+        if _sql_out_vn and _cfg_view_name_chars_valid(_sql_out_vn):
+            default_filename = f"{_sql_out_vn}.sql".replace(' ', '_')
+        else:
+            default_filename = f"vw_{human_fact or selected_table_db.lstrip('_')}.sql".replace('.', '_').replace(' ', '_')
         output_file = st.text_input(
             "Файл вывода:",
             value=str(Path(config.DEFAULT_OUTPUT_DIR) / default_filename),
@@ -3072,65 +3509,77 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                 except (TypeError, ValueError):
                     _mdu = 999
                 _paths = st.session_state.get('gen_rel_key_to_path') or {}
-                sql = vg.generate_view_from_relationships(
-                    fact_table=selected_table_db,
-                    relationships=_rels,
-                    table_config=_tc,
-                    excluded_fields=_excl,
-                    output_format=output_format_code,
-                    naming_style=naming_style_code,
-                    max_depth_down=_md,
-                    max_depth_up=_mdu,
-                    paths_from_root=_paths if _paths else None
-                )
+                _gen_vn = (st.session_state.get('_cfg_save_view_name') or '').strip()
+                _gen_vn_arg = _gen_vn if _gen_vn and _cfg_view_name_chars_valid(_gen_vn) else None
+                if _gen_vn and _gen_vn_arg is None:
+                    st.error("Исправьте имя VIEW в секции 11 или очистите поле — генерация SQL отменена.")
+                else:
+                    sql = vg.generate_view_from_relationships(
+                        fact_table=selected_table_db,
+                        relationships=_rels,
+                        table_config=_tc,
+                        excluded_fields=_excl,
+                        view_name=_gen_vn_arg,
+                        output_format=output_format_code,
+                        naming_style=naming_style_code,
+                        max_depth_down=_md,
+                        max_depth_up=_mdu,
+                        paths_from_root=_paths if _paths else None
+                    )
 
-                st.session_state.gen_generated_sql = sql
+                    st.session_state.gen_generated_sql = sql
 
-                # Сохраняем output format и file в ui_state
-                _fmt_rev = {'CREATE VIEW': 'view', 'SELECT': 'select', 'Оба': 'both'}
-                _save_ui_state({
-                    'gen_output_format': _fmt_rev.get(output_format, 'view'),
-                    'gen_output_file': output_file,
-                })
+                    # Сохраняем output format и file в ui_state
+                    _fmt_rev = {'CREATE VIEW': 'view', 'SELECT': 'select', 'Оба': 'both'}
+                    _save_ui_state({
+                        'gen_output_format': _fmt_rev.get(output_format, 'view'),
+                        'gen_output_file': output_file,
+                    })
 
-                # Сохраняем файл по указанному пути
-                out_path = Path(output_file)
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(out_path, 'w', encoding='utf-8') as f:
-                    f.write(sql)
+                    # Сохраняем файл по указанному пути
+                    out_path = Path(output_file)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(out_path, 'w', encoding='utf-8') as f:
+                        f.write(sql)
 
-                # Сохраняем в архив с метаданными
-                from datetime import datetime
-                _SQL_DIR.mkdir(parents=True, exist_ok=True)
-                ts = datetime.now()
-                safe_name = selected_table_db.replace('.', '_').replace(' ', '_').lstrip('_')
-                archive_name = f"sql_{safe_name}_{ts.strftime('%Y%m%d_%H%M%S')}"
+                    # Сохраняем в архив с метаданными
+                    from datetime import datetime
+                    _SQL_DIR.mkdir(parents=True, exist_ok=True)
+                    ts = datetime.now()
+                    safe_name = selected_table_db.replace('.', '_').replace(' ', '_').lstrip('_')
+                    archive_name = f"sql_{safe_name}_{ts.strftime('%Y%m%d_%H%M%S')}"
 
-                # SQL файл
-                with open(_SQL_DIR / f"{archive_name}.sql", 'w', encoding='utf-8') as f:
-                    f.write(sql)
+                    # SQL файл
+                    with open(_SQL_DIR / f"{archive_name}.sql", 'w', encoding='utf-8') as f:
+                        f.write(sql)
 
-                # Метаданные
-                _active = sum(1 for v in _tc.values() if v.get('enabled'))
-                meta = {
-                    'fact_table': selected_table_db,
-                    'human_name': sp.get_table_human_name(selected_table_db) if sp else None,
-                    'format': output_format_code,
-                    'naming_style': naming_style_code,
-                    'max_depth': max_depth,
-                    'max_depth_up': max_depth_up,
-                    'fix_dates': fix_dates,
-                    'active_tables': _active,
-                    'total_tables': len(_tc),
-                    'sql_lines': sql.count('\n') + 1,
-                    'sql_size': len(sql),
-                    'saved_at': ts.isoformat(),
-                    'sql_file': f"{archive_name}.sql",
-                }
-                with open(_SQL_DIR / f"{archive_name}.json", 'w', encoding='utf-8') as f:
-                    json.dump(meta, f, ensure_ascii=False, indent=2)
+                    # Метаданные (в т.ч. описание и теги из секции 11 — для сквозного поиска)
+                    _active = sum(1 for v in _tc.values() if v.get('enabled'))
+                    _sql_desc = (st.session_state.get('_cfg_save_description') or '').strip()
+                    _sql_tags = _parse_cfg_tags_csv(st.session_state.get('_cfg_save_tags') or '')
+                    meta = {
+                        'fact_table': selected_table_db,
+                        'human_name': sp.get_table_human_name(selected_table_db) if sp else None,
+                        'format': output_format_code,
+                        'naming_style': naming_style_code,
+                        'max_depth': max_depth,
+                        'max_depth_up': max_depth_up,
+                        'fix_dates': fix_dates,
+                        'active_tables': _active,
+                        'total_tables': len(_tc),
+                        'sql_lines': sql.count('\n') + 1,
+                        'sql_size': len(sql),
+                        'saved_at': ts.isoformat(),
+                        'sql_file': f"{archive_name}.sql",
+                        'description': _sql_desc,
+                        'tags': _sql_tags,
+                        'view_name': _gen_vn_arg,
+                        'config_name': (st.session_state.get('_cfg_save_name') or '').strip() or None,
+                    }
+                    with open(_SQL_DIR / f"{archive_name}.json", 'w', encoding='utf-8') as f:
+                        json.dump(meta, f, ensure_ascii=False, indent=2)
 
-                st.success(f"✅ SQL сгенерирован ({sql.count(chr(10))+1} строк) и сохранён в `{out_path.name}`")
+                    st.success(f"✅ SQL сгенерирован ({sql.count(chr(10))+1} строк) и сохранён в `{out_path.name}`")
 
             except Exception as e:
                 st.error(f"❌ Ошибка: {str(e)}\n```\n{traceback.format_exc()}\n```")
