@@ -2051,19 +2051,99 @@ def _render_config_section():
     # Словарь rk → rel для быстрого поиска связи по ключу (нужен для отображения пути)
     _rk_to_rel = {r['relationship_key']: r for r in relationships}
 
-    def _rel_path_direction_code(rk: str) -> str:
+    def _enumerate_rel_key_path_codes():
         """
-        Код пути от корня до связи rk: ↓ — прямая (forward), ↑ — обратная (reverse).
-        Порядок символов совпадает с _rel_key_to_path[rk].
+        Для каждого relationship_key — множество строк ↓/↑ по всем простым путям от корней
+        (таблица не повторяется на пути). Без глобального visited_rk: одно ребро может
+        получить несколько кодов. Лимиты sd/su и длина пути в рёбрах — как в filter_graph.
         """
-        _steps = _rel_key_to_path.get(rk, [rk])
-        _out = []
-        for _e in _steps:
-            _er = _rk_to_rel.get(_e, {})
-            _out.append('↑' if _er.get('direction') == 'reverse' else '↓')
-        return ''.join(_out)
+        from collections import defaultdict
 
-    _all_path_codes = sorted(set(_rel_path_direction_code(r['relationship_key']) for r in _sorted_rels))
+        _max_dd = st.session_state.get('gen_graph_max_depth') or st.session_state.get('gen_max_depth', 999)
+        _max_du = st.session_state.get('gen_graph_max_depth_up') or st.session_state.get('gen_max_depth_up', 999)
+        if not isinstance(_max_dd, int):
+            try:
+                _max_dd = int(_max_dd)
+            except (TypeError, ValueError):
+                _max_dd = 999
+        if not isinstance(_max_du, int):
+            try:
+                _max_du = int(_max_du)
+            except (TypeError, ValueError):
+                _max_du = 999
+        _max_pl = _max_dd + _max_du
+
+        _children_loc = {}
+        _norm_loc = analyzer._normalize_table_name
+        for rel in relationships:
+            direction = rel.get('direction', 'forward')
+            parent = rel['source_table'] if direction == 'forward' else rel['target_table']
+            parent_norm = _norm_loc(parent)
+            for pkey in (parent, parent_norm):
+                lst = _children_loc.setdefault(pkey, [])
+                if rel not in lst:
+                    lst.append(rel)
+        for k in _children_loc:
+            _children_loc[k].sort(key=lambda r: (0 if r.get('direction') != 'reverse' else 1))
+
+        norm_root = _norm_loc(selected_table_db)
+        roots_tp = []
+        if '_VT' in norm_root:
+            doc_from_vt = norm_root.rsplit('_VT', 1)[0]
+            if doc_from_vt and doc_from_vt in _children_loc:
+                roots_tp.append(doc_from_vt)
+        roots_tp.append(norm_root)
+        if norm_root != selected_table_db and selected_table_db not in roots_tp:
+            roots_tp.append(selected_table_db)
+
+        rk_codes = defaultdict(set)
+        _walk_budget = [500_000]
+
+        def _walk_codes(table_name, psd, psu, code_acc, table_path_set):
+            if _walk_budget[0] <= 0:
+                return
+            for rel in _children_loc.get(table_name, []):
+                if _walk_budget[0] <= 0:
+                    return
+                rk = rel['relationship_key']
+                direction = rel.get('direction', 'forward')
+                if direction == 'forward':
+                    csd, csu = psd + 1, psu
+                else:
+                    csd, csu = psd, psu + 1
+                if csd > _max_dd or csu > _max_du:
+                    continue
+                if csd + csu > _max_pl:
+                    continue
+                ch = '↑' if direction == 'reverse' else '↓'
+                new_code = code_acc + ch
+                rk_codes[rk].add(new_code)
+                _walk_budget[0] -= 1
+                child = rel['target_table'] if direction == 'forward' else rel['source_table']
+                cn = _norm_loc(child)
+                if child in table_path_set or cn in table_path_set:
+                    continue
+                _walk_codes(child, csd, csu, new_code, table_path_set | {child, cn})
+
+        for root in roots_tp:
+            _walk_codes(root, 0, 0, '', {root, _norm_loc(root)})
+
+        if _walk_budget[0] <= 0:
+            st.warning(
+                "Перечисление кодов пути остановлено по лимиту шагов (500000); "
+                "фильтр «Код пути» может быть неполным. Сузьте глубину графа."
+            )
+
+        # Сироты / недостижимые от корня в перечислении — один символ по направлению ребра
+        for rel in relationships:
+            rk = rel['relationship_key']
+            if not rk_codes[rk]:
+                rk_codes[rk].add('↑' if rel.get('direction') == 'reverse' else '↓')
+
+        return dict(rk_codes)
+
+    _rel_key_path_codes = _enumerate_rel_key_path_codes()
+    _all_path_codes = sorted({c for codes in _rel_key_path_codes.values() for c in codes})
 
     # Маппинг (show_table, field_name) -> [target_rk, ...] для binary(16) полей
     from collections import defaultdict
@@ -2389,6 +2469,15 @@ def _render_config_section():
     if 'gen_filter_path_codes_applied' not in st.session_state:
         st.session_state.gen_filter_path_codes_applied = list(st.session_state.gen_filter_path_codes)
 
+    # Убрать из выбора коды, которых нет в текущем графе (после миграции *_applied)
+    _valid_pc = set(_all_path_codes)
+    st.session_state.gen_filter_path_codes = [
+        x for x in st.session_state.get('gen_filter_path_codes', []) if x in _valid_pc
+    ]
+    st.session_state.gen_filter_path_codes_applied = [
+        x for x in st.session_state.get('gen_filter_path_codes_applied', []) if x in _valid_pc
+    ]
+
     st.subheader("Фильтрация")
     st.text_input(
         "Поиск в полях связей",
@@ -2452,7 +2541,7 @@ def _render_config_section():
             options=_all_path_codes,
             default=st.session_state.get('gen_filter_path_codes', []),
             key="gen_filter_path_codes",
-            help="Черновик. Пусто — после «Применить» фильтр по коду не действует.",
+            help="Черновик. В списке только коды простых путей в графе. Связь показывается, если её путь совпадает с любым выбранным кодом. Пусто — после «Применить» фильтр не действует.",
         )
     with _pc_btn:
         st.caption("")
@@ -2500,7 +2589,7 @@ def _render_config_section():
         _path_codes_set = set(_path_codes_selected)
         _rels_to_show = [
             r for r in _rels_to_show
-            if _rel_path_direction_code(r['relationship_key']) in _path_codes_set
+            if _path_codes_set & _rel_key_path_codes.get(r['relationship_key'], set())
         ]
     if show_only_selected:
         _rels_to_show = [r for r in _rels_to_show if _rel_n_included.get(r['relationship_key'], 0) > 0]
