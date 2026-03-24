@@ -1856,26 +1856,9 @@ def _render_config_section():
     st.header("10. 🗂️ Настройка таблиц и связей")
     st.caption(f"Найдено {len(relationships)} связей. Отключите ненужные таблицы/поля или измените тип JOIN.")
 
-    # Поиск в полях связей — в начале секции для видимости без прокрутки
-    search_in_rels = st.text_input(
-        "Поиск в полях связей",
-        value=st.session_state.get('gen_filter_search', ''),
-        key="gen_filter_search",
-        placeholder="Подстрока в таблицах, полях (без учёта регистра). Пусто — показывать все.",
-        help="Поиск без учёта регистра в именах таблиц и полей. Пусто — показывать все."
-    )
-
-    # Глобальный параметр: показывать мусорные поля (влияет только на отображение, не на признак выбора)
-    show_junk_fields = st.checkbox(
-        "🗑️ Показывать мусорные поля",
-        value=st.session_state.get('gen_show_junk_fields', False),
-        key="gen_show_junk_fields",
-        help="Если выключено — мусорные поля скрыты из списка. Признак выбора поля сохраняется независимо."
-    )
-
     def _is_field_visible_for_display(table_name, field_name):
-        """Поле показывается в форме, если оно не мусорное ИЛИ включён показ мусорных."""
-        if show_junk_fields:
+        """Поле показывается в форме, если оно не мусорное ИЛИ включён показ мусорных (чекбокс в блоке «Фильтрация»)."""
+        if st.session_state.get('gen_show_junk_fields', False):
             return True
         return not analyzer.is_junk_field(table_name, field_name)
 
@@ -2373,8 +2356,216 @@ def _render_config_section():
                             vis_idx += 1
                         st.markdown("---")
 
-    # ─── Корневая таблица (таблица фактов) ──────────────────────────────
-    _root_key = f"__root__{selected_table_db}"
+    # Проверка пути до корня — ОТКЛЮЧЕНО: вызывает много обращений к БД и зависание при большом графе.
+    # TODO: перевести на отложенное выполнение или выполнять только при генерации SQL.
+
+    # Уникальные уровни и длины пути из текущего графа (для фильтров)
+    _all_levels = sorted(set(_rel_key_to_level.get(r['relationship_key'], 0) for r in _sorted_rels))
+    _all_path_lengths = sorted(set(_rel_key_to_path_length.get(r['relationship_key'], 0) for r in _sorted_rels))
+
+    # Сброс фильтров при смене графа (новый хэш) — по умолчанию выбрано всё
+    _gh = st.session_state.get('gen_graph_hash')
+    if 'gen_filter_graph_hash' not in st.session_state or st.session_state.gen_filter_graph_hash != _gh:
+        st.session_state.gen_filter_graph_hash = _gh
+        st.session_state.gen_filter_levels = _all_levels.copy()
+        st.session_state.gen_filter_path_lengths = _all_path_lengths.copy()
+        st.session_state.gen_filter_path_codes = []
+        # Применённые значения = черновик при смене графа (список связей сразу согласован с графом)
+        st.session_state.gen_filter_levels_applied = _all_levels.copy()
+        st.session_state.gen_filter_path_lengths_applied = _all_path_lengths.copy()
+        st.session_state.gen_filter_path_codes_applied = []
+    # Гарантия наличия ключей (на случай устаревшего session_state)
+    if 'gen_filter_levels' not in st.session_state:
+        st.session_state.gen_filter_levels = _all_levels.copy()
+    if 'gen_filter_path_lengths' not in st.session_state:
+        st.session_state.gen_filter_path_lengths = _all_path_lengths.copy()
+    if 'gen_filter_path_codes' not in st.session_state:
+        st.session_state.gen_filter_path_codes = []
+    # Миграция: до этого релиза в session_state не было *_applied — копируем из черновиков
+    if 'gen_filter_levels_applied' not in st.session_state:
+        st.session_state.gen_filter_levels_applied = list(st.session_state.gen_filter_levels)
+    if 'gen_filter_path_lengths_applied' not in st.session_state:
+        st.session_state.gen_filter_path_lengths_applied = list(st.session_state.gen_filter_path_lengths)
+    if 'gen_filter_path_codes_applied' not in st.session_state:
+        st.session_state.gen_filter_path_codes_applied = list(st.session_state.gen_filter_path_codes)
+
+    st.subheader("Фильтрация")
+    st.text_input(
+        "Поиск в полях связей",
+        value=st.session_state.get('gen_filter_search', ''),
+        key="gen_filter_search",
+        placeholder="Подстрока в таблицах, полях (без учёта регистра). Пусто — показывать все.",
+        help="Поиск без учёта регистра в именах таблиц и полей. Пусто — показывать все.",
+    )
+    st.checkbox(
+        "🗑️ Показывать мусорные поля",
+        value=st.session_state.get('gen_show_junk_fields', False),
+        key="gen_show_junk_fields",
+        help="Если выключено — мусорные поля скрыты из списка. Признак выбора поля сохраняется независимо.",
+    )
+
+    _col_cb, _col_lv, _col_pl = st.columns([1, 2, 2])
+    with _col_cb:
+        show_only_selected = st.checkbox(
+            "Показывать только выбранное",
+            value=st.session_state.get('gen_show_only_selected', False),
+            key="gen_show_only_selected",
+            help="Показать только таблицы с выбранными полями; внутри узла — только выбранные поля"
+        )
+    with _col_lv:
+        _lv_ms, _lv_btn = st.columns([4, 1])
+        with _lv_ms:
+            st.multiselect(
+                "Уровень (ур)",
+                options=_all_levels,
+                default=st.session_state.get('gen_filter_levels', _all_levels),
+                key="gen_filter_levels",
+                help="Черновик выбора. Нажмите «Применить» справа, чтобы обновить список связей.",
+            )
+        with _lv_btn:
+            st.caption("")
+            if st.button("Применить", key="gen_apply_filter_levels", use_container_width=True):
+                st.session_state.gen_filter_levels_applied = list(
+                    st.session_state.get("gen_filter_levels", _all_levels)
+                )
+    with _col_pl:
+        _pl_ms, _pl_btn = st.columns([4, 1])
+        with _pl_ms:
+            st.multiselect(
+                "Длина пути (дп)",
+                options=_all_path_lengths,
+                default=st.session_state.get('gen_filter_path_lengths', _all_path_lengths),
+                key="gen_filter_path_lengths",
+                help="Черновик выбора. Нажмите «Применить» справа, чтобы обновить список связей.",
+            )
+        with _pl_btn:
+            st.caption("")
+            if st.button("Применить", key="gen_apply_filter_path_len", use_container_width=True):
+                st.session_state.gen_filter_path_lengths_applied = list(
+                    st.session_state.get("gen_filter_path_lengths", _all_path_lengths)
+                )
+
+    _pc_ms, _pc_btn = st.columns([4, 1])
+    with _pc_ms:
+        st.multiselect(
+            "Код пути (↓ прямая, ↑ обратная)",
+            options=_all_path_codes,
+            default=st.session_state.get('gen_filter_path_codes', []),
+            key="gen_filter_path_codes",
+            help="Черновик. Пусто — после «Применить» фильтр по коду не действует.",
+        )
+    with _pc_btn:
+        st.caption("")
+        if st.button("Применить", key="gen_apply_filter_path_codes", use_container_width=True):
+            st.session_state.gen_filter_path_codes_applied = list(
+                st.session_state.get("gen_filter_path_codes", [])
+            )
+
+    # Связанные таблицы — пагинация: 50 на страницу для ускорения
+    REL_PER_PAGE = 50
+    # enabled / n_included для всех связей (нужно до фильтра «только выбранное» по списку связей)
+    _rel_n_total_cache = st.session_state.get('gen_rel_n_total') or {}
+    _rel_n_included = {}
+    for _r in _sorted_rels:
+        _rk = _r['relationship_key']
+        _excl_set = excluded_fields.get(_rk)
+        _nt = _rel_n_total_cache.get(_rk, 0)
+        if _excl_set is not None and _nt > 0:
+            _ni = _nt - len(_excl_set)
+        else:
+            _ni = 0
+        _rel_n_included[_rk] = _ni
+        _enabled = _ni > 0
+        st.session_state[f"gen_en_{_rk}"] = _enabled
+        _cfg = table_config.get(_rk, {'join_type': _DEFAULT_JOIN})
+        table_config[_rk] = {'enabled': _enabled, 'join_type': _cfg.get('join_type', _DEFAULT_JOIN)}
+
+    search_in_rels = st.session_state.get('gen_filter_search', '')
+
+    # Фильтрация по последнему «Применить» (не по черновику multiselect)
+    _applied_levels = st.session_state.get('gen_filter_levels_applied', _all_levels)
+    _applied_path_lens = st.session_state.get('gen_filter_path_lengths_applied', _all_path_lengths)
+    _filter_by_level = set(_applied_levels) if _applied_levels else set(_all_levels)
+    _filter_by_path = set(_applied_path_lens) if _applied_path_lens else set(_all_path_lengths)
+
+    _rels_to_show = _sorted_rels
+    _rels_to_show = [
+        r for r in _rels_to_show
+        if _rel_key_to_level.get(r['relationship_key'], 0) in _filter_by_level
+        and _rel_key_to_path_length.get(r['relationship_key'], 0) in _filter_by_path
+    ]
+    # Фильтр по коду пути: только при непустом применённом выборе
+    _path_codes_selected = st.session_state.get('gen_filter_path_codes_applied') or []
+    if _path_codes_selected:
+        _path_codes_set = set(_path_codes_selected)
+        _rels_to_show = [
+            r for r in _rels_to_show
+            if _rel_path_direction_code(r['relationship_key']) in _path_codes_set
+        ]
+    if show_only_selected:
+        _rels_to_show = [r for r in _rels_to_show if _rel_n_included.get(r['relationship_key'], 0) > 0]
+
+    # Фильтр по поиску в полях связей (по узлам): ищем во всём тексте узла
+    _search_str = (search_in_rels or '').strip()
+    if _search_str:
+        _search_lower = _search_str.lower()
+
+        def _node_for_rel(r):
+            direction = r.get('direction', 'forward')
+            return r['target_table'] if direction == 'forward' else r['source_table']
+
+        def _build_searchable_text_for_rel(r):
+            """Собирает весь текст узла для поиска: человеческое/техническое имя таблицы, рёбра пути, человеческие имена полей."""
+            direction = r.get('direction', 'forward')
+            show_table = r['source_table'] if direction == 'reverse' else r['target_table']
+            parts = []
+            human_show = sp.get_table_human_name(show_table) if sp else None
+            if human_show:
+                parts.append(human_show)
+            parts.append(show_table)
+            edge_path = _rel_key_to_path.get(r['relationship_key'], [r['relationship_key']])
+            for edge_rk in edge_path:
+                edge_rel = _rk_to_rel.get(edge_rk)
+                if not edge_rel:
+                    continue
+                src = edge_rel.get('source_table', '')
+                tgt = edge_rel.get('target_table', '')
+                fld = edge_rel.get('field_name', '')
+                parts.extend([src, tgt, fld])
+                human_fld = sp.get_field_human_name(src, fld) if sp else None
+                if human_fld:
+                    parts.append(human_fld)
+                arrow = "→" if edge_rel.get('direction') == 'forward' else "←"
+                parts.append(f"{src}.{fld} {arrow} {tgt}._IDRRef")
+            return " ".join(str(p) for p in parts).lower()
+
+        def _rel_path_matches_search(r):
+            searchable = _build_searchable_text_for_rel(r)
+            return _search_lower in searchable
+
+        # Строим matching_nodes по полному графу: узел входит, если хотя бы одна его связь совпадает
+        _matching_nodes = set()
+        for r in _sorted_rels:
+            if _rel_path_matches_search(r):
+                _matching_nodes.add(_node_for_rel(r))
+        _rels_to_show = [r for r in _rels_to_show if _node_for_rel(r) in _matching_nodes]
+
+    # Номера всегда из полного списка _sorted_rels (для поиска таблицы при переключении режимов)
+    _rel_key_to_full_num = {r['relationship_key']: i + 1 for i, r in enumerate(_sorted_rels)}
+
+    n_total = len(_rels_to_show)
+    n_pages = max(1, (n_total + REL_PER_PAGE - 1) // REL_PER_PAGE)
+    if 'gen_rels_page' not in st.session_state:
+        st.session_state.gen_rels_page = 0
+    # При навигации по binary(16) переключаем страницу на целевой узел
+    _nav_rk = st.session_state.get('_nav_scroll_to_rk')
+    if _nav_rk and _nav_rk != _root_key and _rels_to_show:
+        _target_idx = next((i for i, r in enumerate(_rels_to_show) if r['relationship_key'] == _nav_rk), 0)
+        st.session_state.gen_rels_page = min(_target_idx // REL_PER_PAGE, n_pages - 1)
+    page = max(0, min(st.session_state.gen_rels_page, n_pages - 1))
+    st.session_state.gen_rels_page = page
+
+    # ─── Корневая таблица (таблица фактов) — после фильтров, перед списком связей ───
     human_root = sp.get_table_human_name(selected_table_db) if sp else None
     root_display = f"{human_root} ({selected_table_db})" if human_root else selected_table_db
 
@@ -2531,164 +2722,6 @@ def _render_config_section():
             st.markdown("---")
         else:
             st.warning("Не удалось получить список полей корневой таблицы.")
-
-    # Связанные таблицы — пагинация: 50 на страницу для ускорения
-    REL_PER_PAGE = 50
-    # enabled / n_included для всех связей: только dict lookups (без get_columns на каждую связь)
-    _rel_n_total_cache = st.session_state.get('gen_rel_n_total') or {}
-    _rel_n_included = {}
-    for _r in _sorted_rels:
-        _rk = _r['relationship_key']
-        _excl_set = excluded_fields.get(_rk)
-        _nt = _rel_n_total_cache.get(_rk, 0)
-        if _excl_set is not None and _nt > 0:
-            _ni = _nt - len(_excl_set)
-        else:
-            _ni = 0
-        _rel_n_included[_rk] = _ni
-        _enabled = _ni > 0
-        st.session_state[f"gen_en_{_rk}"] = _enabled
-        _cfg = table_config.get(_rk, {'join_type': _DEFAULT_JOIN})
-        table_config[_rk] = {'enabled': _enabled, 'join_type': _cfg.get('join_type', _DEFAULT_JOIN)}
-
-    # Проверка пути до корня — ОТКЛЮЧЕНО: вызывает много обращений к БД и зависание при большом графе.
-    # TODO: перевести на отложенное выполнение или выполнять только при генерации SQL.
-
-    # Уникальные уровни и длины пути из текущего графа (для фильтров)
-    _all_levels = sorted(set(_rel_key_to_level.get(r['relationship_key'], 0) for r in _sorted_rels))
-    _all_path_lengths = sorted(set(_rel_key_to_path_length.get(r['relationship_key'], 0) for r in _sorted_rels))
-
-    # Сброс фильтров при смене графа (новый хэш) — по умолчанию выбрано всё
-    _gh = st.session_state.get('gen_graph_hash')
-    if 'gen_filter_graph_hash' not in st.session_state or st.session_state.gen_filter_graph_hash != _gh:
-        st.session_state.gen_filter_graph_hash = _gh
-        st.session_state.gen_filter_levels = _all_levels.copy()
-        st.session_state.gen_filter_path_lengths = _all_path_lengths.copy()
-        st.session_state.gen_filter_path_codes = []
-    # Гарантия наличия ключей (на случай устаревшего session_state)
-    if 'gen_filter_levels' not in st.session_state:
-        st.session_state.gen_filter_levels = _all_levels.copy()
-    if 'gen_filter_path_lengths' not in st.session_state:
-        st.session_state.gen_filter_path_lengths = _all_path_lengths.copy()
-    if 'gen_filter_path_codes' not in st.session_state:
-        st.session_state.gen_filter_path_codes = []
-
-    _col_cb, _col_lv, _col_pl = st.columns([1, 2, 2])
-    with _col_cb:
-        show_only_selected = st.checkbox(
-            "Показывать только выбранное",
-            value=st.session_state.get('gen_show_only_selected', False),
-            key="gen_show_only_selected",
-            help="Показать только таблицы с выбранными полями; внутри узла — только выбранные поля"
-        )
-    with _col_lv:
-        selected_levels = st.multiselect(
-            "Уровень (ур)",
-            options=_all_levels,
-            default=st.session_state.get('gen_filter_levels', _all_levels),
-            key="gen_filter_levels",
-            help="Фильтр по уровню дерева. По умолчанию — все."
-        )
-    with _col_pl:
-        selected_path_lengths = st.multiselect(
-            "Длина пути (дп)",
-            options=_all_path_lengths,
-            default=st.session_state.get('gen_filter_path_lengths', _all_path_lengths),
-            key="gen_filter_path_lengths",
-            help="Фильтр по длине пути. По умолчанию — все."
-        )
-
-    st.multiselect(
-        "Код пути (↓ прямая, ↑ обратная)",
-        options=_all_path_codes,
-        default=st.session_state.get('gen_filter_path_codes', []),
-        key="gen_filter_path_codes",
-        help="Пусто — фильтр не действует. Иначе только связи с выбранной последовательностью направлений от корня.",
-    )
-
-    # search_in_rels уже отрендерен выше (в начале секции)
-    search_in_rels = st.session_state.get('gen_filter_search', '')
-
-    # Пустой выбор = показывать все (fallback при первом рендере)
-    _filter_by_level = set(selected_levels) if selected_levels else set(_all_levels)
-    _filter_by_path = set(selected_path_lengths) if selected_path_lengths else set(_all_path_lengths)
-
-    _rels_to_show = _sorted_rels
-    _rels_to_show = [
-        r for r in _rels_to_show
-        if _rel_key_to_level.get(r['relationship_key'], 0) in _filter_by_level
-        and _rel_key_to_path_length.get(r['relationship_key'], 0) in _filter_by_path
-    ]
-    # Фильтр по коду пути: только при непустом выборе (пусто — не сужаем список)
-    _path_codes_selected = st.session_state.get('gen_filter_path_codes') or []
-    if _path_codes_selected:
-        _path_codes_set = set(_path_codes_selected)
-        _rels_to_show = [
-            r for r in _rels_to_show
-            if _rel_path_direction_code(r['relationship_key']) in _path_codes_set
-        ]
-    if show_only_selected:
-        _rels_to_show = [r for r in _rels_to_show if _rel_n_included.get(r['relationship_key'], 0) > 0]
-
-    # Фильтр по поиску в полях связей (по узлам): ищем во всём тексте узла
-    _search_str = (search_in_rels or '').strip()
-    if _search_str:
-        _search_lower = _search_str.lower()
-
-        def _node_for_rel(r):
-            direction = r.get('direction', 'forward')
-            return r['target_table'] if direction == 'forward' else r['source_table']
-
-        def _build_searchable_text_for_rel(r):
-            """Собирает весь текст узла для поиска: человеческое/техническое имя таблицы, рёбра пути, человеческие имена полей."""
-            direction = r.get('direction', 'forward')
-            show_table = r['source_table'] if direction == 'reverse' else r['target_table']
-            parts = []
-            human_show = sp.get_table_human_name(show_table) if sp else None
-            if human_show:
-                parts.append(human_show)
-            parts.append(show_table)
-            edge_path = _rel_key_to_path.get(r['relationship_key'], [r['relationship_key']])
-            for edge_rk in edge_path:
-                edge_rel = _rk_to_rel.get(edge_rk)
-                if not edge_rel:
-                    continue
-                src = edge_rel.get('source_table', '')
-                tgt = edge_rel.get('target_table', '')
-                fld = edge_rel.get('field_name', '')
-                parts.extend([src, tgt, fld])
-                human_fld = sp.get_field_human_name(src, fld) if sp else None
-                if human_fld:
-                    parts.append(human_fld)
-                arrow = "→" if edge_rel.get('direction') == 'forward' else "←"
-                parts.append(f"{src}.{fld} {arrow} {tgt}._IDRRef")
-            return " ".join(str(p) for p in parts).lower()
-
-        def _rel_path_matches_search(r):
-            searchable = _build_searchable_text_for_rel(r)
-            return _search_lower in searchable
-
-        # Строим matching_nodes по полному графу: узел входит, если хотя бы одна его связь совпадает
-        _matching_nodes = set()
-        for r in _sorted_rels:
-            if _rel_path_matches_search(r):
-                _matching_nodes.add(_node_for_rel(r))
-        _rels_to_show = [r for r in _rels_to_show if _node_for_rel(r) in _matching_nodes]
-
-    # Номера всегда из полного списка _sorted_rels (для поиска таблицы при переключении режимов)
-    _rel_key_to_full_num = {r['relationship_key']: i + 1 for i, r in enumerate(_sorted_rels)}
-
-    n_total = len(_rels_to_show)
-    n_pages = max(1, (n_total + REL_PER_PAGE - 1) // REL_PER_PAGE)
-    if 'gen_rels_page' not in st.session_state:
-        st.session_state.gen_rels_page = 0
-    # При навигации по binary(16) переключаем страницу на целевой узел
-    _nav_rk = st.session_state.get('_nav_scroll_to_rk')
-    if _nav_rk and _nav_rk != _root_key and _rels_to_show:
-        _target_idx = next((i for i, r in enumerate(_rels_to_show) if r['relationship_key'] == _nav_rk), 0)
-        st.session_state.gen_rels_page = min(_target_idx // REL_PER_PAGE, n_pages - 1)
-    page = max(0, min(st.session_state.gen_rels_page, n_pages - 1))
-    st.session_state.gen_rels_page = page
 
     st.subheader(f"🔗 Связанные таблицы ({n_total})")
     if not _sorted_rels:
