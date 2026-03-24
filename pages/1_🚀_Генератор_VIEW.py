@@ -6,9 +6,13 @@
 
 import streamlit as st
 from streamlit_scroll_to_top import scroll_to_here
+import hashlib
+import io
 import json
 import re
 import traceback
+import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import sys
@@ -165,6 +169,38 @@ def _invalidate_project_config_metadata_caches():
     _load_all_config_and_sql_metadata.clear()
 
 
+def _search_bulk_fp_suffix(filepath: str) -> str:
+    """Стабильный суффикс ключа виджета по пути файла (поиск, массовые операции)."""
+    return hashlib.sha256((filepath or '').encode('utf-8')).hexdigest()[:16]
+
+
+def _zip_search_bulk_configs(json_paths: list) -> bytes:
+    """ZIP с выбранными cfg_*.json (имена файлов в архиве — как на диске)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for p in json_paths:
+            pp = Path(p)
+            if pp.is_file():
+                zf.write(pp, arcname=pp.name)
+    return buf.getvalue()
+
+
+def _zip_search_bulk_sql_archive(sql_dir: Path, selected_meta: list) -> bytes:
+    """ZIP: для каждого элемента sql_*.json + соответствующий .sql (если есть)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for ssm in selected_meta:
+            jp = ssm.get('filepath')
+            if jp and Path(jp).is_file():
+                zf.write(jp, arcname=Path(jp).name)
+            sf = ssm.get('sql_file', '')
+            if sf:
+                sp = sql_dir / sf
+                if sp.is_file():
+                    zf.write(sp, arcname=sf)
+    return buf.getvalue()
+
+
 def _render_cfg_sql_global_search(search_query: str):
     """Сквозной поиск по всем cfg_*.json и sql_*.json (без фильтра по графу)."""
     _CONFIGS_DIR_SEARCH = Path(config.DEFAULT_OUTPUT_DIR) / "configs"
@@ -203,6 +239,8 @@ def _render_cfg_sql_global_search(search_query: str):
     if _search_cfg_results:
         with st.expander(f"📂 Конфигурации ({len(_search_cfg_results)})", expanded=True):
             for j, scm in enumerate(_search_cfg_results):
+                _fp_cfg = scm.get('filepath') or ''
+                _h_cfg = _search_bulk_fp_suffix(_fp_cfg)
                 _s_name = scm.get('name') or scm.get('human_name') or scm.get('fact_table', '?')
                 _s_tags = scm.get('tags', []) or []
                 _s_tags_str = ' '.join(f'[{t}]' for t in _s_tags) if _s_tags else ''
@@ -212,8 +250,15 @@ def _render_cfg_sql_global_search(search_query: str):
                 if _s_desc_short:
                     _s_label += f" — {_s_desc_short}"
 
-                scol_load, scol_del = st.columns([5, 1])
-                with scol_load:
+                _cb_col, _btn_col = st.columns([0.5, 6])
+                with _cb_col:
+                    st.checkbox(
+                        "массовый выбор",
+                        key=f"search_bulk_cfg_{_h_cfg}",
+                        label_visibility="collapsed",
+                        help="Выбрать для ZIP или удаления",
+                    )
+                with _btn_col:
                     if st.button(f"📌 {_s_label}", key=f"search_cfg_load_{j}", use_container_width=True):
                         with open(scm['filepath'], 'r', encoding='utf-8') as f:
                             full_data = json.load(f)
@@ -242,12 +287,12 @@ def _render_cfg_sql_global_search(search_query: str):
                             _apply_loaded_cfg_metadata_to_widgets(full_data)
                             st.success("✅ Конфигурация загружена из поиска")
                         st.rerun()
-                with scol_del:
-                    st.caption('')
 
     if _search_sql_results:
         with st.expander(f"📄 SQL-результаты ({len(_search_sql_results)})", expanded=True):
             for j, ssm in enumerate(_search_sql_results):
+                _fp_sql = ssm.get('filepath') or ''
+                _h_sql = _search_bulk_fp_suffix(_fp_sql)
                 _ss_name = ssm.get('human_name') or ssm.get('fact_table', '?')
                 _ss_tags = ssm.get('tags', []) or []
                 _ss_tags_str = ' '.join(f'[{t}]' for t in _ss_tags) if _ss_tags else ''
@@ -255,17 +300,100 @@ def _render_cfg_sql_global_search(search_query: str):
                 _ss_label = f"{_ss_name} | {ssm.get('sql_lines', '?')} строк | {_ss_saved} {_ss_tags_str}"
                 _sql_file = ssm.get('sql_file', '')
                 _sql_path = _SQL_DIR_SEARCH / _sql_file if _sql_file else None
-                if _sql_path and _sql_path.exists():
-                    _sql_content = _sql_path.read_text(encoding='utf-8')
-                    st.download_button(
-                        f"📥 {_ss_label}",
-                        data=_sql_content.encode('utf-8'),
-                        file_name=_sql_file or 'export.sql',
-                        mime='text/sql',
-                        key=f"search_sql_dl_{j}",
+                _cb_sql, _row_sql = st.columns([0.5, 6])
+                with _cb_sql:
+                    st.checkbox(
+                        "массовый выбор",
+                        key=f"search_bulk_sql_{_h_sql}",
+                        label_visibility="collapsed",
+                        help="Выбрать для ZIP или удаления",
                     )
-                else:
-                    st.caption(f"📄 {_ss_label} (файл не найден)")
+                with _row_sql:
+                    if _sql_path and _sql_path.exists():
+                        _sql_content = _sql_path.read_text(encoding='utf-8')
+                        st.download_button(
+                            f"📥 {_ss_label}",
+                            data=_sql_content.encode('utf-8'),
+                            file_name=_sql_file or 'export.sql',
+                            mime='text/sql',
+                            key=f"search_sql_dl_{j}",
+                        )
+                    else:
+                        st.caption(f"📄 {_ss_label} (файл .sql не найден)")
+
+    if _search_cfg_results or _search_sql_results:
+        _sel_cfg_paths = []
+        for _scm in _search_cfg_results:
+            _p = _scm.get('filepath') or ''
+            if _p and st.session_state.get(f"search_bulk_cfg_{_search_bulk_fp_suffix(_p)}", False):
+                _sel_cfg_paths.append(_p)
+
+        _sel_sql_meta = []
+        for _ssm in _search_sql_results:
+            _p = _ssm.get('filepath') or ''
+            if _p and st.session_state.get(f"search_bulk_sql_{_search_bulk_fp_suffix(_p)}", False):
+                _sel_sql_meta.append(_ssm)
+
+        _n_cfg_sel = len(_sel_cfg_paths)
+        _n_sql_sel = len(_sel_sql_meta)
+        _n_tot_sel = _n_cfg_sel + _n_sql_sel
+
+        st.divider()
+        st.caption("Массовые операции по отмеченным строкам в списках выше")
+        _ts_zip = datetime.now().strftime('%Y%m%d_%H%M%S')
+        _zcol1, _zcol2, _zcol3 = st.columns([2, 2, 4])
+        with _zcol1:
+            st.download_button(
+                "Скачать конфигурации (ZIP)",
+                data=_zip_search_bulk_configs(_sel_cfg_paths) if _n_cfg_sel else b'',
+                file_name=f"configs_export_{_ts_zip}.zip",
+                mime='application/zip',
+                disabled=_n_cfg_sel == 0,
+                key="search_bulk_zip_cfg",
+            )
+        with _zcol2:
+            st.download_button(
+                "Скачать SQL-архив (ZIP)",
+                data=_zip_search_bulk_sql_archive(_SQL_DIR_SEARCH, _sel_sql_meta) if _n_sql_sel else b'',
+                file_name=f"sql_archive_export_{_ts_zip}.zip",
+                mime='application/zip',
+                disabled=_n_sql_sel == 0,
+                key="search_bulk_zip_sql",
+            )
+        with _zcol3:
+            if _n_tot_sel > 0:
+                st.checkbox(
+                    f"Подтвердить удаление {_n_tot_sel} элементов ({_n_cfg_sel} конфиг., {_n_sql_sel} SQL)",
+                    key="search_bulk_del_confirm",
+                )
+            _confirm_del = bool(st.session_state.get("search_bulk_del_confirm")) if _n_tot_sel > 0 else False
+            if st.button(
+                "Удалить выбранные",
+                key="search_bulk_del_btn",
+                disabled=_n_tot_sel == 0 or not _confirm_del,
+                type="primary",
+            ):
+                _del_errors = []
+                for _cp in _sel_cfg_paths:
+                    try:
+                        Path(_cp).unlink(missing_ok=True)
+                    except Exception as _e_c:
+                        _del_errors.append(f"{_cp}: {_e_c}")
+                for _sm in _sel_sql_meta:
+                    _jp = Path(_sm.get('filepath', ''))
+                    _sf = _sm.get('sql_file', '')
+                    _sp = _SQL_DIR_SEARCH / _sf if _sf else None
+                    try:
+                        if _jp.is_file():
+                            _jp.unlink()
+                        if _sp is not None and _sp.is_file():
+                            _sp.unlink()
+                    except Exception as _e_s:
+                        _del_errors.append(f"{_jp}: {_e_s}")
+                _invalidate_project_config_metadata_caches()
+                if _del_errors:
+                    st.error("Ошибки при удалении:\n" + "\n".join(_del_errors[:15]))
+                st.rerun()
 
     if not _search_cfg_results and not _search_sql_results:
         st.info(f"Ничего не найдено по запросу «{search_query}»")
@@ -1940,6 +2068,20 @@ def _render_config_section():
     # Словарь rk → rel для быстрого поиска связи по ключу (нужен для отображения пути)
     _rk_to_rel = {r['relationship_key']: r for r in relationships}
 
+    def _rel_path_direction_code(rk: str) -> str:
+        """
+        Код пути от корня до связи rk: ↓ — прямая (forward), ↑ — обратная (reverse).
+        Порядок символов совпадает с _rel_key_to_path[rk].
+        """
+        _steps = _rel_key_to_path.get(rk, [rk])
+        _out = []
+        for _e in _steps:
+            _er = _rk_to_rel.get(_e, {})
+            _out.append('↑' if _er.get('direction') == 'reverse' else '↓')
+        return ''.join(_out)
+
+    _all_path_codes = sorted(set(_rel_path_direction_code(r['relationship_key']) for r in _sorted_rels))
+
     # Маппинг (show_table, field_name) -> [target_rk, ...] для binary(16) полей
     from collections import defaultdict
     _field_to_target = defaultdict(list)
@@ -2422,11 +2564,14 @@ def _render_config_section():
         st.session_state.gen_filter_graph_hash = _gh
         st.session_state.gen_filter_levels = _all_levels.copy()
         st.session_state.gen_filter_path_lengths = _all_path_lengths.copy()
+        st.session_state.gen_filter_path_codes = []
     # Гарантия наличия ключей (на случай устаревшего session_state)
     if 'gen_filter_levels' not in st.session_state:
         st.session_state.gen_filter_levels = _all_levels.copy()
     if 'gen_filter_path_lengths' not in st.session_state:
         st.session_state.gen_filter_path_lengths = _all_path_lengths.copy()
+    if 'gen_filter_path_codes' not in st.session_state:
+        st.session_state.gen_filter_path_codes = []
 
     _col_cb, _col_lv, _col_pl = st.columns([1, 2, 2])
     with _col_cb:
@@ -2453,6 +2598,14 @@ def _render_config_section():
             help="Фильтр по длине пути. По умолчанию — все."
         )
 
+    st.multiselect(
+        "Код пути (↓ прямая, ↑ обратная)",
+        options=_all_path_codes,
+        default=st.session_state.get('gen_filter_path_codes', []),
+        key="gen_filter_path_codes",
+        help="Пусто — фильтр не действует. Иначе только связи с выбранной последовательностью направлений от корня.",
+    )
+
     # search_in_rels уже отрендерен выше (в начале секции)
     search_in_rels = st.session_state.get('gen_filter_search', '')
 
@@ -2466,6 +2619,14 @@ def _render_config_section():
         if _rel_key_to_level.get(r['relationship_key'], 0) in _filter_by_level
         and _rel_key_to_path_length.get(r['relationship_key'], 0) in _filter_by_path
     ]
+    # Фильтр по коду пути: только при непустом выборе (пусто — не сужаем список)
+    _path_codes_selected = st.session_state.get('gen_filter_path_codes') or []
+    if _path_codes_selected:
+        _path_codes_set = set(_path_codes_selected)
+        _rels_to_show = [
+            r for r in _rels_to_show
+            if _rel_path_direction_code(r['relationship_key']) in _path_codes_set
+        ]
     if show_only_selected:
         _rels_to_show = [r for r in _rels_to_show if _rel_n_included.get(r['relationship_key'], 0) > 0]
 
