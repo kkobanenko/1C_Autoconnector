@@ -684,7 +684,10 @@ class RelationshipBuilder:
                             'relationship_key': rk,
                         })
 
-                        if new_sd < max_depth_down or new_su < max_depth_up:
+                        # Ставим в очередь конечную вершину, пока суммарная длина пути не превышает бюджет.
+                        # Раньше требовали «запас» по sd или su (new_sd < max_dd or new_su < max_du) — из состояния
+                        # вроде (3,1) при max 3+1 очередь не пополнялась, и не раскрывались ↓ из таблицы после ↑.
+                        if (new_sd + new_su) <= (max_depth_down + max_depth_up):
                             queue.append((target_table, new_sd, new_su))
 
             # ── Шаги ВВЕРХ ──
@@ -718,12 +721,16 @@ class RelationshipBuilder:
                         'relationship_key': rk,
                     })
 
-                    if new_sd < max_depth_down or new_su < max_depth_up:
+                    if (new_sd + new_su) <= (max_depth_down + max_depth_up):
                         queue.append((src_table, new_sd, new_su))
 
         _elapsed_total = _time.time() - _t0
         _log.info("══ END build_mixed_graph ══  results=%d  bfs_iters=%d  visited=%d  total=%.1fs",
                   len(results), _bfs_iter, len(visited_keys), _elapsed_total)
+
+        # Снимок списка рёбер до filter_graph: UI «Код пути» перечисляет простые пути
+        # по этой топологии, чтобы не терять варианты (↑ затем ↓ и т.д.), отрезаемые постобработкой.
+        self.last_graph_before_filter = list(results)
 
         results = self.filter_graph(results, normalized_base, base_table, max_depth_down, max_depth_up,
                                      normalize_fn=self._normalize_table_name)
