@@ -5,4 +5,5 @@ streamlit>=1.37.0
 streamlit-scroll-to-top>=0.0.4
 networkx>=3.0
 matplotlib>=3.5
+openpyxl>=3.1.0
 

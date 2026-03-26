@@ -24,8 +24,41 @@ from builders.relationship_builder import RelationshipBuilder
 from generators.view_generator import ViewGenerator
 from utils.db_connection import test_connection, get_connection_string_from_params
 from analyzers.fact_table_assessor import FactTableAssessor
+from analyzers import fact_assessment_store as fact_assess_store
 from analyzers.field_filter import FieldFilter
 import config
+
+
+@st.cache_data(show_spinner=False)
+def _cached_fact_bulk_xlsx(rows_json: str) -> bytes:
+    """Кеширует генерацию XLSX по JSON строк отчёта (без openpyxl на каждый рендер)."""
+    return fact_assess_store.export_to_xlsx_bytes(json.loads(rows_json))
+
+
+def _sort_bulk_assessment_rows(rows: list, col: str, ascending: bool) -> list:
+    """
+    Сортирует строки отчёта массовой оценки по колонке.
+    Пустые значения в ключе сортировки помещаются в конец (независимо от направления).
+    """
+    if not rows or not col or col not in rows[0]:
+        return list(rows)
+
+    def _norm(v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return str(v).lower()
+
+    nonempty = [r for r in rows if _norm(r.get(col)) is not None]
+    empty = [r for r in rows if _norm(r.get(col)) is None]
+    nonempty.sort(key=lambda r: _norm(r.get(col)), reverse=not ascending)
+    return nonempty + empty
 
 
 def _parse_cfg_tags_csv(tags_str):
@@ -402,6 +435,7 @@ def _render_cfg_sql_global_search(search_query: str):
 # ─── Персистентность состояния ─────────────────────────────────────────────
 _UI_STATE_FILE = Path(config.DEFAULT_OUTPUT_DIR) / "ui_state.json"
 _LAST_SESSION_FILE = Path(config.DEFAULT_OUTPUT_DIR) / "last_session.json"
+_FACT_ASSESSMENTS_FILE = Path(config.DEFAULT_OUTPUT_DIR) / "fact_assessments.json"
 
 def _load_ui_state() -> dict:
     """Загружает сохранённое состояние UI с диска."""
@@ -1045,6 +1079,14 @@ st.header("5. 📋 Выбор таблицы фактов")
 
 sp = st.session_state.gen_structure_parser
 
+_cur_fact_table = _saved_ui.get('gen_fact_table_db')
+if _cur_fact_table:
+    _cur_fact_human = sp.get_table_human_name(_cur_fact_table) if sp else None
+    if _cur_fact_human:
+        st.info(f"Выбрана таблица фактов: **{_cur_fact_human}** ({_cur_fact_table})")
+    else:
+        st.info(f"Выбрана таблица фактов: **{_cur_fact_table}**")
+
 # Получаем все таблицы
 @st.cache_data(ttl=600)
 def _get_table_list(_connection_string):
@@ -1288,6 +1330,217 @@ with st.expander("📊 Детали оценки", expanded=(assessment.score !=
         weight_str = f"+{w.weight}" if w.weight > 0 else str(w.weight)
         st.markdown(f"**{icon} [{w.heuristic_id}]** {w.message} *(вес: {weight_str})*")
     st.caption(f"Итоговый вес: **{assessment.total_weight}** (≥3 = хорошо, ≥0 = может подойти, <0 = не подходит)")
+
+# ─── Массовая оценка, файл накопления, сводная таблица, экспорт XLSX ─────
+with st.expander("📑 Массовая оценка и сводный отчёт", expanded=False):
+    st.caption(
+        f"По кнопке ниже оцениваются **все таблицы текущего списка п.5** ({len(table_options)} шт.) "
+        "(тот же фильтр по типу и поиск). Результаты дописываются в **output/fact_assessments.json**: "
+        "для каждой таблицы хранится последняя оценка. Колонка «Избранное» — **favorites** "
+        "в **output/ui_state.json** (отдельный favorites.json не используется)."
+    )
+    _bulk_store = fact_assess_store.load_store(_FACT_ASSESSMENTS_FILE)
+    _bulk_ui_once = _load_ui_state()
+    # Снимок избранного: стабилизирует data для data_editor между ререндерами чекбокса.
+    if "_bulk_fav_snapshot" not in st.session_state:
+        st.session_state["_bulk_fav_snapshot"] = dict(_bulk_ui_once.get("favorites", {}) or {})
+    _fav_live = st.session_state["_bulk_fav_snapshot"]
+    _bulk_names = [db for _lbl, db in table_options]
+    _bulk_human = lambda t: sp.get_table_human_name(t) if sp else None
+    _rows_ui = fact_assess_store.build_rows_from_store(_bulk_store, _bulk_human, _fav_live)
+    _pref_order_bulk = [
+        "Избранное",
+        "Таблица (техн.)",
+        "Человекочитаемое имя",
+        "Итог",
+        "Итоговый вес",
+        "Пояснение",
+        "Ошибка",
+        "Оценено (UTC)",
+    ] + fact_assess_store.HEURISTIC_IDS + fact_assess_store.FACT_METRIC_DISPLAY_LABELS
+    _rows_ordered = fact_assess_store.order_table_rows(_rows_ui, _pref_order_bulk) if _rows_ui else []
+
+    # Явная сортировка (session_state) — переживает st.rerun() после смены «Избранное» (см. ниже).
+    _rows_display: list = []
+    if _rows_ui:
+        _sort_options = [c for c in _pref_order_bulk if c in _rows_ordered[0]]
+        _default_sort_col = "Итоговый вес"
+        _def_sort_idx = (
+            _sort_options.index(_default_sort_col)
+            if _default_sort_col in _sort_options
+            else 0
+        )
+        _sc1, _sc2 = st.columns([2, 1])
+        with _sc1:
+            st.selectbox(
+                "Сортировка таблицы",
+                options=_sort_options,
+                index=min(_def_sort_idx, len(_sort_options) - 1),
+                key="gen_bulk_sort_col",
+                help="Порядок строк и экспорт XLSX соответствуют выбранной колонке; "
+                "не сбрасывается при отметке «Избранное».",
+            )
+        with _sc2:
+            st.radio(
+                "Направление",
+                options=["asc", "desc"],
+                index=1,
+                format_func=lambda x: "По возрастанию" if x == "asc" else "По убыванию",
+                horizontal=True,
+                key="gen_bulk_sort_dir",
+            )
+        _sort_col_active = st.session_state.get("gen_bulk_sort_col", _default_sort_col)
+        if _sort_col_active not in _sort_options:
+            _sort_col_active = _sort_options[0] if _sort_options else ""
+        _sort_dir_active = st.session_state.get("gen_bulk_sort_dir", "desc")
+        _asc_active = _sort_dir_active == "asc"
+        _rows_display = _sort_bulk_assessment_rows(
+            _rows_ordered, _sort_col_active, _asc_active
+        )
+    else:
+        _rows_display = []
+
+    _bc1, _bc2, _bc3, _bc4 = st.columns([1.2, 1.2, 1.2, 1.4])
+    with _bc1:
+        if st.button("Массовая оценка", type="primary", key="gen_fact_bulk_run"):
+            st.session_state.gen_fact_bulk_cancel_requested = False
+            _ass_bulk = FactTableAssessor(analyzer, sp)
+            _pbar = st.progress(0.0, text="Запуск…")
+
+            def _bulk_prog(done: int, total: int, cap: str) -> None:
+                if total <= 0:
+                    _pbar.progress(1.0, text="Нет таблиц")
+                    return
+                _frac = min(1.0, max(1.0 / total, float(done) / float(total)))
+                _pbar.progress(_frac, text=cap[:120] if cap else f"{done}/{total}")
+
+            _upd = fact_assess_store.assess_tables_bulk(
+                _ass_bulk,
+                _bulk_names,
+                on_progress=_bulk_prog,
+                should_cancel=lambda: bool(st.session_state.get("gen_fact_bulk_cancel_requested")),
+            )
+            _merged_bulk = fact_assess_store.merge_updates(_bulk_store, _upd)
+            fact_assess_store.save_store(_FACT_ASSESSMENTS_FILE, _merged_bulk)
+            _pbar.progress(1.0, text="Сохранено")
+            st.session_state.gen_fact_bulk_cancel_requested = False
+            _n_done = len(_upd)
+            _n_tot = len(_bulk_names)
+            if _n_done < _n_tot:
+                st.warning(
+                    f"Остановлено запросом отмены: обработано **{_n_done}** из **{_n_tot}**. "
+                    "Частичные результаты сохранены."
+                )
+            else:
+                st.success(f"Обновлено записей: **{_n_done}**. Файл сохранён.")
+            st.session_state.pop("_bulk_fav_snapshot", None)
+            st.rerun()
+    with _bc2:
+        if st.button("Отменить массовую оценку", key="gen_fact_bulk_cancel"):
+            st.session_state.gen_fact_bulk_cancel_requested = True
+            st.caption("Отмена сработает между таблицами (при длинном прогоне UI Streamlit не опрашивает кнопки до конца шага).")
+    with _bc3:
+        if _rows_display:
+            _rows_json = json.dumps(_rows_display, ensure_ascii=False, default=str)
+            st.download_button(
+                label="Скачать XLSX",
+                data=_cached_fact_bulk_xlsx(_rows_json),
+                file_name=f"fact_assessments_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="gen_fact_bulk_xlsx",
+            )
+        else:
+            st.caption("Нет строк для экспорта — сначала запустите массовую оценку.")
+    with _bc4:
+        st.caption(f"В файле сейчас: **{len(_bulk_store.get('by_table') or {})}** таблиц")
+
+    if not _rows_ui:
+        st.info("Сводная таблица пуста. Запустите массовую оценку или загрузите существующий JSON.")
+    else:
+        _edit_disable = [c for c in _pref_order_bulk if c != "Избранное"]
+        _edit_disable.extend(
+            c for c in _rows_display[0].keys() if c not in _edit_disable and c != "Избранное"
+        )
+        # Стабильный ключ + снимок избранного: data не меняется при клике чекбокса → скролл сохраняется.
+        _edited = st.data_editor(
+            _rows_display,
+            disabled=_edit_disable,
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+            key="gen_fact_bulk_editor",
+            column_config={
+                "Избранное": st.column_config.CheckboxColumn("Избранное", help="То же избранное, что в п.5"),
+                "Итоговый вес": st.column_config.NumberColumn("Итоговый вес", format="%d"),
+            },
+        )
+
+        def _editor_to_records(ed) -> list:
+            if isinstance(ed, list):
+                return ed
+            if hasattr(ed, "to_dict"):
+                return ed.to_dict("records")
+            raise TypeError("Неизвестный тип результата data_editor")
+
+        _changed_fav = False
+        _fav_mut = dict(_fav_live)
+        for _trow in _editor_to_records(_edited):
+            _tn = _trow["Таблица (техн.)"]
+            _want = bool(_trow.get("Избранное"))
+            _has = _tn in _fav_mut
+            if _want and not _has:
+                _lab = (_trow.get("Человекочитаемое имя") or "") or _tn
+                _fav_mut[_tn] = {"comment": "", "label": str(_lab)}
+                _changed_fav = True
+            elif not _want and _has:
+                del _fav_mut[_tn]
+                _changed_fav = True
+        if _changed_fav:
+            # Только диск; снимок НЕ обновляем — data_editor получает тот же data → скролл сохраняется.
+            _save_ui_state({"favorites": _fav_mut})
+
+        st.markdown("**Выбор таблицы фактов из отчёта**")
+        _ok_for_pick = [
+            r for r in _rows_ui
+            if not (r.get("Ошибка") or "").strip() and r.get("Итог")
+        ]
+        if not _ok_for_pick:
+            st.caption("Нет успешно оценённых строк — выберите таблицу в п.5.")
+        else:
+            _ok_for_pick.sort(
+                key=lambda r: (
+                    0 if r.get("Итог") == "good" else 1 if r.get("Итог") == "maybe" else 2,
+                    -(r["Итоговый вес"] if r["Итоговый вес"] is not None else -999),
+                    (r.get("Таблица (техн.)") or "").lower(),
+                )
+            )
+            _labels_pick = []
+            for r in _ok_for_pick:
+                _t = r["Таблица (техн.)"]
+                _h = (r.get("Человекочитаемое имя") or "").strip()
+                _labels_pick.append(f"{_h} ({_t})" if _h else _t)
+            _pick_ix = st.selectbox(
+                "Таблица из накопленных оценок",
+                range(len(_ok_for_pick)),
+                format_func=lambda i: _labels_pick[i],
+                key="gen_fact_bulk_pick_table",
+            )
+            if st.button("Сделать выбранную таблицей фактов", key="gen_fact_bulk_apply_pick"):
+                _picked = _ok_for_pick[_pick_ix]["Таблица (техн.)"]
+                _picked_lbl = _labels_pick[_pick_ix]
+                st.session_state._pending_gen_reset = {
+                    "gen_type_filter": "Все",
+                    "gen_table_search": "",
+                    "gen_fact_table_db": _picked,
+                }
+                _save_ui_state({
+                    "gen_fact_table_db": _picked,
+                    "gen_type_filter": "Все",
+                    "gen_table_search": "",
+                })
+                st.success(f"Будет выбрана: **{_picked_lbl}**")
+                st.session_state.pop("_bulk_fav_snapshot", None)
+                st.rerun()
 
 st.markdown("---")
 
