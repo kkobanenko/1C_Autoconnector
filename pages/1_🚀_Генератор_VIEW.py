@@ -1841,11 +1841,14 @@ def _render_config_section():
             del st.session_state['gen_jump_target_page']
         st.rerun()
 
-    # Навигация по binary(16): _nav_scroll_to_rk — куда прокрутить; _nav_back_to_rk — откуда пришли (для «Назад»)
+    # Навигация по binary(16): _nav_scroll_to_rk — куда прокрутить; _nav_back_stack — стек откуда пришли (для «Назад»)
     if '_nav_scroll_to_rk' not in st.session_state:
         st.session_state._nav_scroll_to_rk = None
-    if '_nav_back_to_rk' not in st.session_state:
-        st.session_state._nav_back_to_rk = None
+    # Миграция: старый одиночный _nav_back_to_rk → стек _nav_back_stack
+    if '_nav_back_stack' not in st.session_state:
+        _old_back = st.session_state.pop('_nav_back_to_rk', None)
+        st.session_state._nav_back_stack = [_old_back] if _old_back is not None else []
+    _NAV_STACK_LIMIT = 32
     if '_nav_arrived_at_rk' not in st.session_state:
         st.session_state._nav_arrived_at_rk = None
 
@@ -1949,6 +1952,8 @@ def _render_config_section():
         st.session_state.gen_rel_n_total = {}
 
     _DEFAULT_JOIN = 'INNER JOIN'
+    # Типы JOIN в UI и в генерируемом T-SQL; первый — дефолт для новых связей.
+    _JOIN_TYPE_OPTIONS = ('INNER JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL OUTER JOIN')
 
     # Строим порядок DFS только от корневой таблицы факта (selected_table_db) по отфильтрованному графу.
     # tree_indent — по первому вхождению в DFS; ур./дп. в шапке и фильтры — по вариантам путей (см. ниже).
@@ -2063,6 +2068,7 @@ def _render_config_section():
                 _max_du = 999
         _max_pl = _max_dd + _max_du
         _filtered_rks = {r['relationship_key'] for r in relationships}
+        _rk_to_rel_pc = {r['relationship_key']: r for r in _rels_for_path_codes}
         _ch = {}
         _nl = analyzer._normalize_table_name
         for rel in _rels_for_path_codes:
@@ -2076,17 +2082,83 @@ def _render_config_section():
         for k in _ch:
             _ch[k].sort(key=lambda r: (0 if r.get('direction') != 'reverse' else 1))
 
+        def _rel_depth(r):
+            """Глубина ребра в BFS-снимке (sd+su на конце шага) для сравнения дубликатов одного логического ребра."""
+            d = r.get('depth')
+            if d is not None:
+                return int(d)
+            return int(r.get('steps_down', 0)) + int(r.get('steps_up', 0))
+
+        def _pick_representative_rel(group_list):
+            """Один rk на логическое ребро: приоритет rk из отфильтрованного графа, иначе минимальная depth, затем rk."""
+            best = None
+            for r in group_list:
+                rid = r['relationship_key']
+                in_f = rid in _filtered_rks
+                dep = _rel_depth(r)
+                if best is None:
+                    best = r
+                    continue
+                b_in = best['relationship_key'] in _filtered_rks
+                b_dep = _rel_depth(best)
+                if in_f and not b_in:
+                    best = r
+                elif not in_f and b_in:
+                    continue
+                elif dep < b_dep:
+                    best = r
+                elif dep == b_dep and rid < best['relationship_key']:
+                    best = r
+            return best
+
         def _outg(tb):
-            _s = set()
-            _acc = []
+            # Собрать кандидатов один раз по rid (избежать дублей при tb == нормализованному tb).
+            _seen_rid = set()
+            _candidates = []
             for key in (tb, _nl(tb)):
                 for r in _ch.get(key, []):
                     rid = r['relationship_key']
-                    if rid in _s:
+                    if rid in _seen_rid:
                         continue
-                    _s.add(rid)
-                    _acc.append(r)
+                    _seen_rid.add(rid)
+                    _candidates.append(r)
+            # Одно исходящее «логическое» ребро: BFS даёт разные relationship_key (sd/su в суффиксе rk).
+            _by_log = {}
+            for r in _candidates:
+                log_k = (
+                    r['source_table'],
+                    r['field_name'],
+                    r['target_table'],
+                    r.get('direction', 'forward'),
+                )
+                _by_log.setdefault(log_k, []).append(r)
+            _acc = [_pick_representative_rel(g) for g in _by_log.values()]
+            _acc.sort(
+                key=lambda r: (
+                    0 if r.get('direction') != 'reverse' else 1,
+                    r['field_name'],
+                    r['relationship_key'],
+                )
+            )
             return _acc
+
+        def _path_visual_signature(path_rks):
+            """Кортеж (source, field, target, direction) по каждому шагу — для дедупа визуально совпадающих путей."""
+            out = []
+            for erk in path_rks:
+                er = _rk_to_rel_pc.get(erk)
+                if er is None:
+                    out.append((erk,))
+                else:
+                    out.append(
+                        (
+                            er['source_table'],
+                            er['field_name'],
+                            er['target_table'],
+                            er.get('direction', 'forward'),
+                        )
+                    )
+            return tuple(out)
 
         _variants = defaultdict(list)
         _seen_key = set()
@@ -2114,7 +2186,8 @@ def _render_config_section():
                 new_cum = dict(cum_by_rk)
                 new_cum[rk] = (csd, csu)
                 npath = path_rks + [rk]
-                sig = (rk, tuple(npath))
+                nvis = _path_visual_signature(npath)
+                sig = (rk, nvis)
                 if sig not in _seen_key:
                     _seen_key.add(sig)
                     if rk in _filtered_rks and len(_variants[rk]) < _max_variants_per_rk:
@@ -2139,6 +2212,15 @@ def _render_config_section():
             _variants[_rk].sort(
                 key=lambda v: (v['path_length'], abs(v['level']), len(v['path_rks']), tuple(v['path_rks']))
             )
+            _seen_vis = set()
+            _deduped = []
+            for v in _variants[_rk]:
+                vsig = _path_visual_signature(v['path_rks'])
+                if vsig in _seen_vis:
+                    continue
+                _seen_vis.add(vsig)
+                _deduped.append(v)
+            _variants[_rk] = _deduped
         return _variants
 
     _rel_key_path_variants = _collect_path_variants_from_fact_root()
@@ -2440,15 +2522,17 @@ def _render_config_section():
                         st.rerun()
             else:
                 # Развёрнутый узел: кнопка свернуть, link, join_type, поля
-                show_back = st.session_state.get('_nav_arrived_at_rk') == rk
+                _back_stack = st.session_state._nav_back_stack
+                show_back = st.session_state.get('_nav_arrived_at_rk') == rk and len(_back_stack) > 0
                 if show_back:
-                    back_rel = _rk_to_rel.get(st.session_state.get('_nav_back_to_rk'))
+                    _peek_back_rk = _back_stack[-1]
+                    back_rel = _rk_to_rel.get(_peek_back_rk)
                     if back_rel:
                         direction_b = back_rel.get('direction', 'forward')
                         back_show = back_rel['source_table'] if direction_b == 'reverse' else back_rel['target_table']
                         back_human = sp.get_table_human_name(back_show) if sp else None
                         back_label = f"{back_human} ({back_show})" if back_human else back_show
-                    elif st.session_state.get('_nav_back_to_rk') == _root_key:
+                    elif _peek_back_rk == _root_key:
                         back_human = sp.get_table_human_name(selected_table_db) if sp else None
                         back_label = f"{back_human} ({selected_table_db})" if back_human else selected_table_db
                     else:
@@ -2456,12 +2540,12 @@ def _render_config_section():
                     row1, row2, row3 = st.columns([3, 1, 1])
                     with row2:
                         if st.button(f"← Назад к {back_label}", key=f"nav_back_{rk}"):
-                            _back_rk = st.session_state._nav_back_to_rk
+                            _back_rk = _back_stack.pop()
                             _expanded_nodes.add(_back_rk)
                             st.session_state['_config_expanded_nodes'] = _expanded_nodes
                             st.session_state._nav_scroll_to_rk = _back_rk
-                            st.session_state._nav_back_to_rk = None
-                            st.session_state._nav_arrived_at_rk = None
+                            # Если в стеке ещё есть элементы — arrived_at = _back_rk, чтобы показать кнопку «Назад» там
+                            st.session_state._nav_arrived_at_rk = _back_rk if _back_stack else None
                             st.session_state.gen_excluded_fields = excluded_fields
                             st.rerun()
                     with row3:
@@ -2469,7 +2553,7 @@ def _render_config_section():
                             _expanded_nodes.discard(rk)
                             st.session_state['_config_expanded_nodes'] = _expanded_nodes
                             st.session_state._nav_arrived_at_rk = None
-                            st.session_state._nav_back_to_rk = None
+                            st.session_state._nav_back_stack = []
                             st.session_state.gen_excluded_fields = excluded_fields
                             st.rerun()
                 else:
@@ -2509,12 +2593,27 @@ def _render_config_section():
                         if len(_pvars) > 1 and _pi < len(_pvars) - 1:
                             st.caption("---")
                 with col_jt:
+                    _jt_cur = (cfg.get('join_type') or _DEFAULT_JOIN).strip().upper()
+                    try:
+                        _jt_idx = _JOIN_TYPE_OPTIONS.index(_jt_cur)
+                    except ValueError:
+                        _jt_idx = 0
                     join_type = st.selectbox(
-                        "JOIN", ["LEFT JOIN", "INNER JOIN"],
-                        index=1 if cfg.get('join_type', _DEFAULT_JOIN) == 'INNER JOIN' else 0,
+                        "JOIN",
+                        list(_JOIN_TYPE_OPTIONS),
+                        index=_jt_idx,
                         key=f"gen_jt_{rk}",
-                        label_visibility="collapsed"
+                        label_visibility="collapsed",
+                        help=(
+                            "FULL OUTER JOIN может сильно увеличить число строк результата и нагрузку "
+                            "на сервер при разреженных или не совпадающих ключах."
+                        ),
                     )
+                    if join_type == "FULL OUTER JOIN":
+                        st.caption(
+                            "Предупреждение: FULL OUTER JOIN на больших таблицах 1С может дать очень "
+                            "большой результат и медленный запрос."
+                        )
 
                 table_config[rk] = {'enabled': enabled, 'join_type': join_type}
 
@@ -2599,7 +2698,9 @@ def _render_config_section():
                                             if st.button("→", key=f"nav_to_{rk}_{cname}", help="Перейти к настройке таблицы"):
                                                 _expanded_nodes.add(_chosen_rk)
                                                 st.session_state['_config_expanded_nodes'] = _expanded_nodes
-                                                st.session_state._nav_back_to_rk = rk
+                                                _bs = st.session_state._nav_back_stack
+                                                if len(_bs) < _NAV_STACK_LIMIT:
+                                                    _bs.append(rk)
                                                 st.session_state._nav_scroll_to_rk = _chosen_rk
                                                 st.session_state.gen_excluded_fields = excluded_fields
                                                 st.rerun()
@@ -2618,7 +2719,9 @@ def _render_config_section():
                                             if st.button("→", key=f"nav_to_{rk}_{cname}", help=tip):
                                                 _expanded_nodes.add(_trk)
                                                 st.session_state['_config_expanded_nodes'] = _expanded_nodes
-                                                st.session_state._nav_back_to_rk = rk
+                                                _bs = st.session_state._nav_back_stack
+                                                if len(_bs) < _NAV_STACK_LIMIT:
+                                                    _bs.append(rk)
                                                 st.session_state._nav_scroll_to_rk = _trk
                                                 st.session_state.gen_excluded_fields = excluded_fields
                                                 st.rerun()
@@ -2667,6 +2770,10 @@ def _render_config_section():
         st.session_state.gen_filter_levels_applied = _all_levels.copy()
         st.session_state.gen_filter_path_lengths_applied = _all_path_lengths.copy()
         st.session_state.gen_filter_path_codes_applied = []
+        # Смена графа: старые rk в стеке «Назад» недействительны
+        st.session_state._nav_back_stack = []
+        st.session_state._nav_scroll_to_rk = None
+        st.session_state._nav_arrived_at_rk = None
     # Гарантия наличия ключей (на случай устаревшего session_state)
     if 'gen_filter_levels' not in st.session_state:
         st.session_state.gen_filter_levels = _all_levels.copy()
@@ -2730,10 +2837,10 @@ def _render_config_section():
     with _col_lv:
         _lv_ms, _lv_btn = st.columns([4, 1])
         with _lv_ms:
+            # Значение только из session_state (ключ задаётся выше); default= вместе с key даёт предупреждение Streamlit.
             st.multiselect(
                 "Уровень (ур)",
                 options=_all_levels,
-                default=st.session_state.get('gen_filter_levels', _all_levels),
                 key="gen_filter_levels",
                 help="Черновик выбора. Нажмите «Применить» справа, чтобы обновить список связей.",
             )
@@ -2749,7 +2856,6 @@ def _render_config_section():
             st.multiselect(
                 "Длина пути (дп)",
                 options=_all_path_lengths,
-                default=st.session_state.get('gen_filter_path_lengths', _all_path_lengths),
                 key="gen_filter_path_lengths",
                 help=(
                     "Черновик. Работает в паре с «Уровень»: отбор по одному варианту пути (см. ПутьN в развёрнутом узле), "
@@ -2768,7 +2874,6 @@ def _render_config_section():
         st.multiselect(
             "Код пути (↓ прямая, ↑ обратная)",
             options=_all_path_codes,
-            default=st.session_state.get('gen_filter_path_codes', []),
             key="gen_filter_path_codes",
             help=(
                 "Черновик. Коды считаются только от корневой таблицы (блок «Корневая таблица»), не от документа-родителя ТЧ и т.п. "
@@ -2925,7 +3030,22 @@ def _render_config_section():
         n_included_root = n_total_root - len(excluded_fields[_root_key])
 
     root_header = f"⭐ Корневая таблица: {root_display} — полей: {n_included_root}/{n_total_root}"
-    with st.expander(root_header, expanded=True):
+
+    # Блок «Корневая таблица»: по умолчанию свёрнут (новый ключ в session_state для этой корневой таблицы).
+    # stateful expander: key + on_change="rerun" — литерал из typing API Streamlit (не callback).
+    # Требуется streamlit>=1.37 (key у expander). Начальное значение — только setdefault; True перед виджетом
+    # при навигации к корню — штатная программная установка session_state.
+    _root_expander_key = f"gen_config_root_expanded_{_root_key}"
+    st.session_state.setdefault(_root_expander_key, False)
+    if st.session_state.get("_nav_scroll_to_rk") == _root_key:
+        st.session_state[_root_expander_key] = True
+
+    with st.expander(
+        root_header,
+        expanded=st.session_state[_root_expander_key],
+        key=_root_expander_key,
+        on_change="rerun",
+    ):
         if root_cols:
             # Прокрутка к корню при навигации «Назад»
             if st.session_state.get('_nav_scroll_to_rk') == _root_key:
@@ -2934,9 +3054,10 @@ def _render_config_section():
                 st.session_state._nav_arrived_at_rk = _root_key
 
             # Кнопка «← Назад» при возврате из связанной таблицы
-            if st.session_state.get('_nav_arrived_at_rk') == _root_key:
-                back_rk = st.session_state.get('_nav_back_to_rk')
-                back_rel = _rk_to_rel.get(back_rk) if back_rk else None
+            _back_stack_root = st.session_state._nav_back_stack
+            if st.session_state.get('_nav_arrived_at_rk') == _root_key and len(_back_stack_root) > 0:
+                _peek_back_root = _back_stack_root[-1]
+                back_rel = _rk_to_rel.get(_peek_back_root)
                 if back_rel:
                     direction_b = back_rel.get('direction', 'forward')
                     back_show = back_rel['source_table'] if direction_b == 'reverse' else back_rel['target_table']
@@ -2945,12 +3066,12 @@ def _render_config_section():
                 else:
                     back_label = "источник"
                 if st.button(f"← Назад к {back_label}", key=f"nav_back_{_root_key}"):
+                    _popped_rk = _back_stack_root.pop()
                     _expanded_nodes = set(st.session_state.get('_config_expanded_nodes', set()))
-                    _expanded_nodes.add(back_rk)
+                    _expanded_nodes.add(_popped_rk)
                     st.session_state['_config_expanded_nodes'] = _expanded_nodes
-                    st.session_state._nav_scroll_to_rk = back_rk
-                    st.session_state._nav_back_to_rk = None
-                    st.session_state._nav_arrived_at_rk = None
+                    st.session_state._nav_scroll_to_rk = _popped_rk
+                    st.session_state._nav_arrived_at_rk = _popped_rk if _back_stack_root else None
                     st.session_state.gen_excluded_fields = excluded_fields
                     st.rerun()
             # Список полей сразу при раскрытии expander корня (без кнопки «Поля …»).
@@ -3028,7 +3149,9 @@ def _render_config_section():
                                     _expanded_nodes = set(st.session_state.get('_config_expanded_nodes', set()))
                                     _expanded_nodes.add(_chosen_rk_r)
                                     st.session_state['_config_expanded_nodes'] = _expanded_nodes
-                                    st.session_state._nav_back_to_rk = _root_key
+                                    _bs_r = st.session_state._nav_back_stack
+                                    if len(_bs_r) < _NAV_STACK_LIMIT:
+                                        _bs_r.append(_root_key)
                                     st.session_state._nav_scroll_to_rk = _chosen_rk_r
                                     st.session_state.gen_excluded_fields = excluded_fields
                                     st.rerun()
@@ -3048,7 +3171,9 @@ def _render_config_section():
                                     _expanded_nodes = set(st.session_state.get('_config_expanded_nodes', set()))
                                     _expanded_nodes.add(_trk)
                                     st.session_state['_config_expanded_nodes'] = _expanded_nodes
-                                    st.session_state._nav_back_to_rk = _root_key
+                                    _bs_r = st.session_state._nav_back_stack
+                                    if len(_bs_r) < _NAV_STACK_LIMIT:
+                                        _bs_r.append(_root_key)
                                     st.session_state._nav_scroll_to_rk = _trk
                                     st.session_state.gen_excluded_fields = excluded_fields
                                     st.rerun()

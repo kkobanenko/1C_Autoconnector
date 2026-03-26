@@ -398,7 +398,7 @@ if st.button("🚀 Сгенерировать VIEW", type="primary"):
             # Сохраняем данные в session_state ПЕРЕД st.stop()
             st.session_state.relationships_collected = relationships
             
-            # Инициализируем конфигурацию по умолчанию (все связи включены, LEFT JOIN)
+            # Инициализируем конфигурацию по умолчанию (все связи включены, INNER JOIN — как в мастере)
             # Очищаем старую конфигурацию при новом построении графа
             st.session_state.table_config = {}
             
@@ -452,7 +452,7 @@ if st.button("🚀 Сгенерировать VIEW", type="primary"):
                 # Инициализируем конфигурацию связи
                 st.session_state.table_config[rel['relationship_key']] = {
                     'enabled': enabled,
-                    'join_type': 'LEFT JOIN'
+                    'join_type': 'INNER JOIN'
                 }
             
             # Логируем общую статистику
@@ -693,7 +693,7 @@ if st.session_state.get('graph_built') and st.session_state.get('relationships_c
                 "table_config": {
                     "relationship_key": {
                         "enabled": true/false,
-                        "join_type": "LEFT JOIN" | "INNER JOIN" | "RIGHT JOIN"
+                        "join_type": "INNER JOIN" | "LEFT JOIN" | "RIGHT JOIN" | "FULL OUTER JOIN"  # по умолчанию в UI — INNER
                     },
                     ...
                 },
@@ -773,7 +773,7 @@ if st.session_state.get('graph_built') and st.session_state.get('relationships_c
                     
                     # Обновляем состояние selectbox для типа JOIN
                     join_type_key = f"join_type_{rel_key}"
-                    join_type_value = config_item.get('join_type', 'LEFT JOIN')
+                    join_type_value = config_item.get('join_type', 'INNER JOIN')
                     st.session_state[join_type_key] = join_type_value
                     
                     # Тип JOIN уже обновлен в table_config и в session_state для selectbox
@@ -966,7 +966,7 @@ if st.session_state.get('graph_built') and st.session_state.get('relationships_c
             if rel_key not in st.session_state.table_config:
                 st.session_state.table_config[rel_key] = {
                     'enabled': True,
-                    'join_type': 'LEFT JOIN'
+                    'join_type': 'INNER JOIN'
                 }
             
             # Получаем текущее состояние из конфигурации
@@ -1053,17 +1053,32 @@ if st.session_state.get('graph_built') and st.session_state.get('relationships_c
                 if join_type_key in st.session_state:
                     current_join_type = st.session_state[join_type_key]
                 else:
-                    current_join_type = config.get('join_type', 'LEFT JOIN')
+                    current_join_type = config.get('join_type', 'INNER JOIN')
                     st.session_state[join_type_key] = current_join_type
                 
+                _manual_join_options = ["INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL OUTER JOIN"]
+                _mj_norm = str(current_join_type or "INNER JOIN").strip().upper()
+                try:
+                    _mj_idx = _manual_join_options.index(_mj_norm)
+                except ValueError:
+                    _mj_idx = 0
                 join_type = st.selectbox(
                     "Тип JOIN",
-                    ["LEFT JOIN", "INNER JOIN", "RIGHT JOIN"],
-                    index=["LEFT JOIN", "INNER JOIN", "RIGHT JOIN"].index(current_join_type),
+                    _manual_join_options,
+                    index=_mj_idx,
                     key=join_type_key,
                     disabled=not enabled,
-                    label_visibility="collapsed"
+                    label_visibility="collapsed",
+                    help=(
+                        "Как в мастере: для новых связей по умолчанию INNER JOIN. "
+                        "FULL OUTER JOIN может сильно увеличить объём результата."
+                    ),
                 )
+                if join_type == "FULL OUTER JOIN":
+                    st.caption(
+                        "Предупреждение: FULL OUTER JOIN на больших таблицах 1С может дать очень "
+                        "большой результат и медленный запрос."
+                    )
                 # Обновляем конфигурацию при изменении
                 st.session_state.table_config[rel_key]['join_type'] = join_type
             

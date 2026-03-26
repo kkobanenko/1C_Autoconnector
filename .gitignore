@@ -29,6 +29,7 @@ output/
 input/
 
 # Temporary files
+tmp/
 temp/
 *.tmp
 *.log

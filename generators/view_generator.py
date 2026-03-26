@@ -20,6 +20,11 @@ from db.structure_analyzer import StructureAnalyzer
 from builders.relationship_builder import RelationshipBuilder
 from parsers.structure_parser import StructureParser
 
+# Допустимые ключевые слова JOIN в T-SQL (как в UI генератора).
+_ALLOWED_SQL_JOIN_TYPES = frozenset({
+    'INNER JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL OUTER JOIN',
+})
+
 
 class ViewGenerator:
     """
@@ -567,8 +572,14 @@ class ViewGenerator:
         for rel in sorted_rels:
             rk = rel['relationship_key']
             direction = rel.get('direction', 'forward')
-            join_type = table_config.get(rk, {}).get('join_type', 'INNER JOIN').upper()
-            if join_type not in ('LEFT JOIN', 'INNER JOIN', 'RIGHT JOIN'):
+            _raw_cfg_jt = table_config.get(rk, {}).get('join_type', 'INNER JOIN')
+            join_type = str(_raw_cfg_jt).upper()
+            if join_type not in _ALLOWED_SQL_JOIN_TYPES:
+                logging.warning(
+                    "[ViewGenerator] Неизвестный join_type %r для связи %s (sorted_rels), подставляется INNER JOIN.",
+                    _raw_cfg_jt,
+                    rk,
+                )
                 join_type = 'INNER JOIN'
 
             source_table, source_alias = rel['source_table'], rel['source_alias']
@@ -995,10 +1006,15 @@ class ViewGenerator:
         if self.table_config:
             config_item = self.table_config.get(relationship_key)
             if config_item and 'join_type' in config_item:
-                join_type = config_item['join_type'].upper()
-                # Проверяем валидность типа JOIN
-                if join_type not in ['LEFT JOIN', 'INNER JOIN', 'RIGHT JOIN']:
-                    join_type = "INNER JOIN"  # По умолчанию
+                _raw_jt = config_item['join_type']
+                join_type = str(_raw_jt).upper()
+                if join_type not in _ALLOWED_SQL_JOIN_TYPES:
+                    logging.warning(
+                        "[ViewGenerator] Неизвестный join_type %r для связи %s, подставляется INNER JOIN.",
+                        _raw_jt,
+                        relationship_key,
+                    )
+                    join_type = "INNER JOIN"
         
         # Формируем JOIN
         schema, table = self.analyzer._parse_table_name(target_table)
