@@ -18,6 +18,7 @@ from db.structure_analyzer import StructureAnalyzer
 from builders.relationship_builder import RelationshipBuilder
 from generators.view_generator import ViewGenerator
 from utils.db_connection import test_connection, get_connection_string_from_params
+from utils.sidebar_context import render_context_sidebar
 import config
 
 
@@ -165,8 +166,11 @@ if structure_file_path and Path(structure_file_path).exists():
     try:
         _manual_sp = StructureParser(structure_file_path)
         _manual_sp.parse()
+        st.session_state.manual_structure_file_path = structure_file_path
+        st.session_state.structure_parser = _manual_sp
     except Exception:
         _manual_sp = None
+        st.session_state.pop("manual_structure_file_path", None)
 
 # Получаем список таблиц из БД (если подключение установлено)
 if st.session_state.connection_tested and st.session_state.connection_string:
@@ -245,6 +249,11 @@ else:
         value="_Document653",
         help="Введите человеческое или техническое название таблицы"
     )
+
+# Для sidebar и последующих секций — текущий выбор таблицы, даже без нажатия «Сгенерировать».
+st.session_state.fact_table_db = fact_table.strip() if fact_table else None
+
+render_context_sidebar("manual")
 
 # Параметры генерации
 col1, col2, col3 = st.columns(3)

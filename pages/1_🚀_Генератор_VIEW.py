@@ -5,8 +5,11 @@
 """
 
 import streamlit as st
+import streamlit.components.v1 as st_components
 from streamlit_scroll_to_top import scroll_to_here
+import base64
 import hashlib
+import html as html_module
 import io
 import json
 import re
@@ -23,6 +26,7 @@ from db.structure_analyzer import StructureAnalyzer
 from builders.relationship_builder import RelationshipBuilder
 from generators.view_generator import ViewGenerator
 from utils.db_connection import test_connection, get_connection_string_from_params
+from utils.sidebar_context import render_context_sidebar
 from analyzers.fact_table_assessor import FactTableAssessor
 from analyzers import fact_assessment_store as fact_assess_store
 from analyzers.field_filter import FieldFilter
@@ -66,6 +70,216 @@ def _parse_cfg_tags_csv(tags_str):
     if not tags_str:
         return []
     return [t.strip().lower() for t in tags_str.split(',') if t.strip()]
+
+
+def _copy_text_clipboard_button(label: str, text: str, *, element_id_suffix: str = "sql") -> None:
+    """
+    Кнопка «скопировать в буфер»: весь текст в системный буфер обмена.
+    Сначала Clipboard API (localhost / https); на http:// по IP — fallback через execCommand.
+    Текст в base64 в разметке, чтобы SQL не ломал тег script.
+    Внешний вид — как secondary-кнопка Streamlit (как у st.download_button по умолчанию).
+    """
+    if text is None or text == "":
+        return
+    payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    # Уникальный суффикс на случай нескольких встроенных блоков на одной странице.
+    sid = hashlib.sha256(payload.encode("ascii")).hexdigest()[:10]
+    btn_id = f"cp_btn_{element_id_suffix}_{sid}"
+    msg_id = f"cp_msg_{element_id_suffix}_{sid}"
+    safe_label = html_module.escape(label)
+    html_block = f"""
+<style>
+  /* Параметры близки к BaseButton secondary в теме Streamlit по умолчанию (светлая). */
+  .st-clipboard-wrap {{
+    font-family: "Source Sans Pro", sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.25rem;
+    width: 100%;
+  }}
+  .st-clipboard-wrap button.st-clipboard-btn {{
+    box-sizing: border-box;
+    width: 100%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0;
+    font-weight: 400;
+    font-family: inherit;
+    font-size: 0.875rem;
+    line-height: 1.25rem;
+    padding: 0.375rem 0.75rem;
+    min-height: 2.5rem;
+    color: rgb(49, 51, 63);
+    background-color: rgb(255, 255, 255);
+    border: 1px solid rgb(224, 230, 238);
+    border-radius: 0.5rem;
+    cursor: pointer;
+    user-select: none;
+    transition: border-color 200ms ease, color 200ms ease, background-color 200ms ease;
+  }}
+  .st-clipboard-wrap button.st-clipboard-btn:hover {{
+    border-color: rgb(255, 75, 75);
+    color: rgb(255, 75, 75);
+  }}
+  .st-clipboard-wrap button.st-clipboard-btn:active {{
+    border-color: rgb(255, 75, 75);
+    color: rgb(255, 75, 75);
+    background-color: rgb(250, 250, 252);
+  }}
+  .st-clipboard-wrap button.st-clipboard-btn:focus {{
+    outline: none;
+  }}
+  .st-clipboard-wrap button.st-clipboard-btn:focus-visible {{
+    box-shadow: rgb(255, 75, 75) 0px 0px 0px 0.2rem;
+  }}
+  .st-clipboard-wrap .st-clipboard-msg {{
+    color: rgb(49, 51, 63);
+    font-size: 0.875rem;
+    line-height: 1.25rem;
+    min-height: 1.25rem;
+  }}
+</style>
+<div class="st-clipboard-wrap">
+  <button id="{btn_id}" type="button" class="st-clipboard-btn">{safe_label}</button>
+  <span id="{msg_id}" class="st-clipboard-msg"></span>
+</div>
+<script>
+(function () {{
+  const b64 = "{payload}";
+  const btn = document.getElementById("{btn_id}");
+  const msg = document.getElementById("{msg_id}");
+  if (!btn || !msg) return;
+
+  function decodeUtf8FromB64(b64s) {{
+    const bin = atob(b64s);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder("utf-8").decode(bytes);
+  }}
+
+  /** execCommand — запасной путь для http:// по IP (небезопасный контекст). */
+  function copyViaTextarea(t) {{
+    const ta = document.createElement("textarea");
+    ta.value = t;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "0";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, t.length);
+    var ok = false;
+    try {{
+      ok = document.execCommand("copy");
+    }} finally {{
+      document.body.removeChild(ta);
+    }}
+    if (!ok) throw new Error("execCommand copy failed");
+  }}
+
+  btn.onclick = async function () {{
+    try {{
+      const t = decodeUtf8FromB64(b64);
+      var copied = false;
+      if (navigator.clipboard && window.isSecureContext) {{
+        try {{
+          await navigator.clipboard.writeText(t);
+          copied = true;
+        }} catch (e1) {{
+          /* например, отказ прав — пробуем textarea */
+        }}
+      }}
+      if (!copied) {{
+        copyViaTextarea(t);
+      }}
+      msg.textContent = "Скопировано";
+      setTimeout(function () {{ msg.textContent = ""; }}, 2500);
+    }} catch (e) {{
+      msg.textContent =
+        "Не удалось скопировать. Выделите SQL в поле выше или скачайте файл.";
+      setTimeout(function () {{ msg.textContent = ""; }}, 5000);
+    }}
+  }};
+}})();
+</script>
+"""
+    # Кнопка (~2.5rem) + строка статуса + запас под iframe; иначе сообщение обрезается.
+    st_components.html(html_block, height=88)
+
+
+def _gen_sql_archive_scroll_bridge(*, restore: bool) -> None:
+    """
+    Сохраняет позицию скролла основного приложения в sessionStorage (throttle) и по флагу
+    restore восстанавливает после удаления записи из архива (fragment-rerun).
+
+    Работает с родительским окном Streamlit: чаще скролл у [data-testid="stAppViewContainer"],
+    иначе window — см. комментарии в JS.
+    """
+    restore_lit = "true" if restore else "false"
+    html = f"""
+<script>
+(function () {{
+  var keyY = "gen_sql_archive_scroll_y";
+  var restoreNow = {restore_lit};
+
+  function readScroll() {{
+    var p = window.parent;
+    try {{
+      var m = p.document.querySelector('[data-testid="stAppViewContainer"]');
+      if (m) return m.scrollTop;
+      return p.scrollY || (p.document.documentElement && p.document.documentElement.scrollTop) || 0;
+    }} catch (e) {{ return 0; }}
+  }}
+
+  function writeScroll(y) {{
+    var p = window.parent;
+    try {{
+      var m = p.document.querySelector('[data-testid="stAppViewContainer"]');
+      if (m) {{ m.scrollTop = y; return; }}
+      p.scrollTo(0, y);
+    }} catch (e) {{}}
+  }}
+
+  function installSaver() {{
+    var par = window.parent;
+    if (par.__genSqlArchiveScrollSaver) return;
+    par.__genSqlArchiveScrollSaver = true;
+    var t = null;
+    function save() {{
+      clearTimeout(t);
+      t = setTimeout(function () {{
+        try {{ sessionStorage.setItem(keyY, String(readScroll())); }} catch (e) {{}}
+      }}, 80);
+    }}
+    try {{
+      par.addEventListener("scroll", save, {{ passive: true }});
+      var m = par.document.querySelector('[data-testid="stAppViewContainer"]');
+      if (m) m.addEventListener("scroll", save, {{ passive: true }});
+    }} catch (e) {{}}
+  }}
+
+  installSaver();
+
+  if (restoreNow) {{
+    try {{
+      var ys = sessionStorage.getItem(keyY);
+      if (ys !== null && ys !== "") {{
+        var yv = parseInt(ys, 10);
+        if (!isNaN(yv)) {{
+          requestAnimationFrame(function () {{ writeScroll(yv); }});
+          setTimeout(function () {{ writeScroll(yv); }}, 60);
+          setTimeout(function () {{ writeScroll(yv); }}, 200);
+        }}
+      }}
+    }} catch (e) {{}}
+  }}
+}})();
+</script>
+"""
+    st_components.html(html, height=0, scrolling=False)
 
 
 def _cfg_view_name_chars_valid(name):
@@ -318,6 +532,10 @@ def _render_cfg_sql_global_search(search_query: str):
                             st.session_state.gen_table_config = loaded_tc
                             st.session_state.gen_excluded_fields = restored_excl
                             _apply_loaded_cfg_metadata_to_widgets(full_data)
+                            _fp_s = scm.get("filepath") or ""
+                            if _fp_s:
+                                st.session_state.gen_loaded_cfg_filepath = _fp_s
+                                st.session_state.gen_loaded_cfg_filename = Path(_fp_s).name
                             st.success("✅ Конфигурация загружена из поиска")
                         st.rerun()
 
@@ -502,7 +720,10 @@ def _reset_graph_state():
     st.session_state.gen_excluded_fields = {}
     st.session_state.gen_rel_n_total = {}
     st.session_state.gen_generated_sql = None
+    st.session_state.pop("gen_last_written_sql_path", None)
     _save_ui_state({'gen_graph_hash': None})
+    st.session_state.pop("gen_loaded_cfg_filepath", None)
+    st.session_state.pop("gen_loaded_cfg_filename", None)
 
 _saved_ui = _load_ui_state()
 
@@ -539,6 +760,9 @@ if 'gen_output_fmt' not in st.session_state and _saved_ui.get('gen_output_format
     st.session_state.gen_output_fmt = _fmt_map.get(_saved_ui.get('gen_output_format'), 'CREATE VIEW')
 if 'gen_output_file' not in st.session_state and _saved_ui.get('gen_output_file'):
     st.session_state.gen_output_file = _saved_ui.get('gen_output_file')
+# Фактический путь последнего сохранения SQL (не ключ виджета — можно менять в любой момент).
+if 'gen_last_written_sql_path' not in st.session_state and _saved_ui.get('gen_last_written_sql_path'):
+    st.session_state.gen_last_written_sql_path = _saved_ui.get('gen_last_written_sql_path')
 
 
 st.title("🚀 Генератор VIEW")
@@ -618,6 +842,7 @@ else:
     st.session_state.connection_tested = False
 
 if not st.session_state.connection_tested:
+    render_context_sidebar("gen")
     st.stop()
 
 # Создаём/переиспользуем analyzer (нужен для GUID-индекса и далее)
@@ -1053,6 +1278,7 @@ else:
         st.error("❌ Файл не найден")
 
 if not structure_file_path:
+    render_context_sidebar("gen")
     st.stop()
 
 # Парсим структуру (с кешированием)
@@ -1065,8 +1291,10 @@ def _parse_structure(file_path):
 try:
     sp = _parse_structure(structure_file_path)
     st.session_state.gen_structure_parser = sp
+    st.session_state.gen_structure_file_path = structure_file_path
 except Exception as e:
     st.error(f"❌ Ошибка парсинга: {e}")
+    render_context_sidebar("gen")
     st.stop()
 
 st.markdown("---")
@@ -1078,14 +1306,6 @@ st.markdown("---")
 st.header("5. 📋 Выбор таблицы фактов")
 
 sp = st.session_state.gen_structure_parser
-
-_cur_fact_table = _saved_ui.get('gen_fact_table_db')
-if _cur_fact_table:
-    _cur_fact_human = sp.get_table_human_name(_cur_fact_table) if sp else None
-    if _cur_fact_human:
-        st.info(f"Выбрана таблица фактов: **{_cur_fact_human}** ({_cur_fact_table})")
-    else:
-        st.info(f"Выбрана таблица фактов: **{_cur_fact_table}**")
 
 # Получаем все таблицы
 @st.cache_data(ttl=600)
@@ -1166,6 +1386,7 @@ if type_filter == "⭐ Избранное":
     # Показываем только избранные таблицы
     if not _favorites:
         st.info("ℹ️ Список избранного пуст. Добавьте таблицы через кнопку ⭐.")
+        render_context_sidebar("gen")
         st.stop()
     for fav_table, fav_data in _favorites.items():
         fav_label = fav_data.get('label', fav_table)
@@ -1192,6 +1413,7 @@ else:
 
 if not table_options:
     st.warning("Ни одна таблица не найдена с текущим фильтром.")
+    render_context_sidebar("gen")
     st.stop()
 
 # Определяем начальный индекс по последнему выбору
@@ -1219,6 +1441,7 @@ for label, db_name in table_options:
         break
 
 if not selected_table_db:
+    render_context_sidebar("gen")
     st.stop()
 
 # Сброс графа при смене таблицы
@@ -1227,6 +1450,13 @@ if selected_table_db != st.session_state.get('gen_fact_table_db'):
 
 st.session_state.gen_fact_table_db = selected_table_db
 _save_ui_state({'gen_fact_table_db': selected_table_db})
+
+# Подпись после фиксации выбора (сессия + ui_state), чтобы совпадать с selectbox и pending_gen_reset.
+_sel_human = sp.get_table_human_name(selected_table_db) if sp else None
+if _sel_human:
+    st.info(f"Выбрана таблица фактов: **{_sel_human}** ({selected_table_db})")
+else:
+    st.info(f"Выбрана таблица фактов: **{selected_table_db}**")
 
 # ─── Избранные таблицы ────────────────────────────────────────────────────
 _favorites = _saved_ui.get('favorites', {})  # {table_name: {"comment": str, "label": str}}
@@ -1780,6 +2010,8 @@ if (
 ):
     _graph_file = _find_graph_by_hash(selected_table_db, _saved_hash)
     if _graph_file:
+        st.session_state.pop("gen_loaded_cfg_filepath", None)
+        st.session_state.pop("gen_loaded_cfg_filename", None)
         rels, meta, rels_pre = _load_graph(_graph_file)
         st.session_state.gen_relationships_collected = rels
         st.session_state.gen_relationships_path_codes_source = rels_pre
@@ -1847,6 +2079,8 @@ if saved_graphs:
                     st.session_state.gen_table_config = tc
                     st.session_state.gen_excluded_fields = {}
                     st.session_state.gen_rel_n_total = {}
+                    st.session_state.pop("gen_loaded_cfg_filepath", None)
+                    st.session_state.pop("gen_loaded_cfg_filename", None)
                     _save_ui_state({'gen_graph_hash': meta.get('graph_hash')})
                     # Проверяем актуальность
                     saved_hash = meta.get('graph_hash')
@@ -1991,6 +2225,8 @@ if st.button("🔍 Построить граф связей", type="primary", ke
                 st.session_state.gen_table_config = table_config
                 st.session_state.gen_excluded_fields = {}
                 st.session_state.gen_rel_n_total = {}
+                st.session_state.pop("gen_loaded_cfg_filepath", None)
+                st.session_state.pop("gen_loaded_cfg_filename", None)
 
                 # Сохраняем граф на диск (с хэшем)
                 st.write("💾 Сохранение графа на диск...")
@@ -2082,6 +2318,91 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
 # СЕКЦИЯ 7: НАСТРОЙКА СВЯЗЕЙ (Этап 4)
 # ═══════════════════════════════════════════════════════════════════════════
 _USE_FRAGMENT = hasattr(st, 'fragment')
+
+
+def _render_gen_saved_sql_archive() -> None:
+    """
+    Блок «Сохранённые SQL» под секцией 13.
+
+    Снаружи оборачивается в st.fragment (см. ниже): удаление — только перерисовка этого блока
+    (st.rerun(scope='fragment')), без полного прогона страницы.
+
+    В заголовке expander — число записей; стабильный key и после удаления принудительно открываем expander,
+    плюс восстановление скролла (_gen_sql_archive_scroll_bridge), чтобы блок не схлопывался и позиция не терялась.
+
+    Загрузка по 📄 — полный st.rerun(), чтобы обновился текст SQL в секции 13 выше.
+    """
+    _restore_scroll = st.session_state.pop("_gen_sql_archive_restore_scroll", False)
+
+    sql_dir = Path(config.DEFAULT_OUTPUT_DIR) / "sql"
+    saved_sqls = []
+    if sql_dir.exists():
+        for fp in sorted(sql_dir.glob("sql_*.json"), reverse=True):
+            try:
+                with open(fp, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+                meta['meta_path'] = str(fp)
+                meta['sql_path'] = str(fp.parent / meta.get('sql_file', ''))
+                saved_sqls.append(meta)
+            except Exception:
+                continue
+
+    if not saved_sqls:
+        _gen_sql_archive_scroll_bridge(restore=_restore_scroll)
+        return
+
+    with st.expander(
+        f"📂 Сохранённые SQL ({len(saved_sqls)})",
+        key="gen_saved_sql_expander",
+    ):
+        for i, sm in enumerate(saved_sqls):
+            saved_at = sm.get('saved_at', '?')
+            try:
+                dt = datetime.fromisoformat(saved_at)
+                saved_display = dt.strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                saved_display = saved_at
+
+            human = sm.get('human_name') or sm.get('fact_table', '?')
+            fmt = sm.get('format', '?').upper()
+            label = (
+                f"{human} | {fmt} | "
+                f"таблиц: {sm.get('active_tables', '?')}/{sm.get('total_tables', '?')} | "
+                f"{sm.get('sql_lines', '?')} строк | "
+                f"{saved_display}"
+            )
+
+            col_load, col_del = st.columns([5, 1])
+            with col_load:
+                if st.button(f"📄 {label}", key=f"sql_load_{i}", use_container_width=True):
+                    sql_file = sm.get('sql_path', '')
+                    if sql_file and Path(sql_file).exists():
+                        with open(sql_file, 'r', encoding='utf-8') as f:
+                            loaded_sql = f.read()
+                        st.session_state.gen_generated_sql = loaded_sql
+                        st.session_state.gen_last_written_sql_path = sql_file
+                        st.success(f"✅ SQL загружен: {sm.get('sql_lines', '?')} строк")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Файл не найден: `{sql_file}`")
+            with col_del:
+                if st.button("🗑️", key=f"sql_del_{i}"):
+                    try:
+                        Path(sm['meta_path']).unlink(missing_ok=True)
+                        sql_file = sm.get('sql_path', '')
+                        if sql_file:
+                            Path(sql_file).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    st.session_state.gen_saved_sql_expander = True
+                    st.session_state["_gen_sql_archive_restore_scroll"] = True
+                    if _USE_FRAGMENT:
+                        st.rerun(scope="fragment")
+                    else:
+                        st.rerun()
+
+    _gen_sql_archive_scroll_bridge(restore=_restore_scroll)
+
 
 def _render_config_section():
     """Блок настройки таблиц и связей. При st.fragment — rerun только этого блока."""
@@ -3550,6 +3871,7 @@ def _render_config_section():
 
 if _USE_FRAGMENT:
     _render_config_section = st.fragment(_render_config_section)
+    _render_gen_saved_sql_archive = st.fragment(_render_gen_saved_sql_archive)
 
 if st.session_state.gen_graph_built and st.session_state.gen_relationships_collected:
     @st.cache_data(ttl=600)
@@ -3606,6 +3928,8 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                 'table_config': tc_new,
                 'excluded_fields': excl_all,
             }
+            st.session_state.pop("gen_loaded_cfg_filepath", None)
+            st.session_state.pop("gen_loaded_cfg_filename", None)
             st.rerun()
         
         # Список сохранённых конфигураций (кэш диска, см. _load_configs_for_graph)
@@ -3687,6 +4011,10 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                                 st.session_state.gen_table_config = loaded_tc
                                 st.session_state.gen_excluded_fields = restored_excl
                                 _apply_loaded_cfg_metadata_to_widgets(full_data)
+                                _fp_c = cm.get("filepath") or ""
+                                if _fp_c:
+                                    st.session_state.gen_loaded_cfg_filepath = _fp_c
+                                    st.session_state.gen_loaded_cfg_filename = Path(_fp_c).name
                                 st.success(f"✅ Конфигурация загружена: {cm.get('active_tables', '?')} таблиц, {sel_f} полей")
                             st.rerun()
                     with col_edit:
@@ -3842,6 +4170,8 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                                 'table_config': old_data.get('table_config', {}),
                                 'excluded_fields': {},
                             }
+                            st.session_state.gen_loaded_cfg_filepath = str(oc.resolve())
+                            st.session_state.gen_loaded_cfg_filename = oc.name
                             st.success(f"✅ Загружена старая конфигурация: `{oc.name}`")
                             st.rerun()
                     with col_d:
@@ -4437,23 +4767,29 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
 
                     st.session_state.gen_generated_sql = sql
 
-                    # Сохраняем output format и file в ui_state
-                    _fmt_rev = {'CREATE VIEW': 'view', 'SELECT': 'select', 'Оба': 'both'}
-                    _save_ui_state({
-                        'gen_output_format': _fmt_rev.get(output_format, 'view'),
-                        'gen_output_file': output_file,
-                    })
-
-                    # Сохраняем файл по указанному пути
-                    out_path = Path(output_file)
+                    # Одна метка времени для основного файла и архива.
+                    from datetime import datetime
+                    ts = datetime.now()
+                    ts_str = ts.strftime('%Y%m%d_%H%M%S')
+                    # Основной файл: каталог и «основа» имени как в поле «Файл вывода», без перезаписи — добавляем _YYYYMMDD_HHMMSS.
+                    _out_spec = Path(output_file)
+                    out_path = _out_spec.parent / f"{_out_spec.stem}_{ts_str}.sql"
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     with open(out_path, 'w', encoding='utf-8') as f:
                         f.write(sql)
 
+                    # В ui_state: шаблон пути из поля (без метки времени) — иначе stem раздувается при каждом запуске.
+                    # Фактический файл — отдельное поле, не совпадает с key виджета gen_output_file.
+                    st.session_state.gen_last_written_sql_path = str(out_path)
+                    _fmt_rev = {'CREATE VIEW': 'view', 'SELECT': 'select', 'Оба': 'both'}
+                    _save_ui_state({
+                        'gen_output_format': _fmt_rev.get(output_format, 'view'),
+                        'gen_output_file': str(_out_spec),
+                        'gen_last_written_sql_path': str(out_path),
+                    })
+
                     # Сохраняем в архив с метаданными
-                    from datetime import datetime
                     _SQL_DIR.mkdir(parents=True, exist_ok=True)
-                    ts = datetime.now()
                     safe_name = selected_table_db.replace('.', '_').replace(' ', '_').lstrip('_')
                     archive_name = f"sql_{safe_name}_{ts.strftime('%Y%m%d_%H%M%S')}"
 
@@ -4498,6 +4834,8 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
     if st.session_state.gen_generated_sql:
         st.header("13. 📋 Результат SQL")
         sql = st.session_state.gen_generated_sql
+        # После генерации в сессии лежит фактический путь сохранения (с меткой времени), иначе — значение из поля виджета.
+        _out_disp = (st.session_state.get('gen_last_written_sql_path') or output_file or '').strip()
 
         # Показываем SQL в текстовом поле с возможностью копирования
         st.text_area(
@@ -4512,70 +4850,23 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
             st.download_button(
                 "📥 Скачать SQL",
                 data=sql.encode('utf-8'),
-                file_name=Path(output_file).name if output_file else "view.sql",
+                file_name=Path(_out_disp).name if _out_disp else "view.sql",
                 mime="text/sql",
+                use_container_width=True,
                 key="gen_download"
             )
         with col_copy:
+            _copy_text_clipboard_button("📋 Скопировать в буфер", sql, element_id_suffix="gen_sql")
             st.caption(f"📊 Строк: {sql.count(chr(10))+1} | Размер: {len(sql):,} байт")
         with col_info:
-            if output_file and Path(output_file).exists():
-                st.info(f"💾 Сохранён: `{output_file}`")
+            if _out_disp and Path(_out_disp).exists():
+                st.info(f"💾 Сохранён: `{_out_disp}`")
 
     st.markdown("---")
 
-    # ─── Сохранённые SQL ──────────────────────────────────────────────────
-    saved_sqls = []
-    if _SQL_DIR.exists():
-        for fp in sorted(_SQL_DIR.glob("sql_*.json"), reverse=True):
-            try:
-                with open(fp, 'r', encoding='utf-8') as f:
-                    meta = json.load(f)
-                meta['meta_path'] = str(fp)
-                meta['sql_path'] = str(fp.parent / meta.get('sql_file', ''))
-                saved_sqls.append(meta)
-            except Exception:
-                continue
+    # ─── Сохранённые SQL (фрагмент: быстрое удаление без полного rerun) ──
+    _render_gen_saved_sql_archive()
 
-    if saved_sqls:
-        with st.expander(f"📂 Сохранённые SQL ({len(saved_sqls)})", expanded=False):
-            for i, sm in enumerate(saved_sqls):
-                saved_at = sm.get('saved_at', '?')
-                try:
-                    from datetime import datetime
-                    dt = datetime.fromisoformat(saved_at)
-                    saved_display = dt.strftime("%d.%m.%Y %H:%M")
-                except Exception:
-                    saved_display = saved_at
-
-                human = sm.get('human_name') or sm.get('fact_table', '?')
-                fmt = sm.get('format', '?').upper()
-                label = (
-                    f"{human} | {fmt} | "
-                    f"таблиц: {sm.get('active_tables', '?')}/{sm.get('total_tables', '?')} | "
-                    f"{sm.get('sql_lines', '?')} строк | "
-                    f"{saved_display}"
-                )
-
-                col_load, col_del = st.columns([5, 1])
-                with col_load:
-                    if st.button(f"📄 {label}", key=f"sql_load_{i}", use_container_width=True):
-                        sql_file = sm.get('sql_path', '')
-                        if sql_file and Path(sql_file).exists():
-                            with open(sql_file, 'r', encoding='utf-8') as f:
-                                loaded_sql = f.read()
-                            st.session_state.gen_generated_sql = loaded_sql
-                            st.success(f"✅ SQL загружен: {sm.get('sql_lines', '?')} строк")
-                            st.rerun()
-                        else:
-                            st.error(f"❌ Файл не найден: `{sql_file}`")
-                with col_del:
-                    if st.button("🗑️", key=f"sql_del_{i}"):
-                        try:
-                            Path(sm['meta_path']).unlink(missing_ok=True)
-                            sql_file = sm.get('sql_path', '')
-                            if sql_file:
-                                Path(sql_file).unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                        st.rerun()
+    render_context_sidebar("gen")
+else:
+    render_context_sidebar("gen")

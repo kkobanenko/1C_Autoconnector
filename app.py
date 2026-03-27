@@ -6,12 +6,16 @@
 
 import streamlit as st
 
+from utils.sidebar_context import render_context_sidebar
+
 # Настройка страницы (вызывается ТОЛЬКО здесь, в главном app.py)
 st.set_page_config(
     page_title="Генератор SQL VIEW для 1С",
     page_icon="📊",
     layout="wide"
 )
+
+render_context_sidebar("home")
 
 st.title("📊 Генератор SQL VIEW для 1С")
 st.markdown("""
