@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 # Версия плагина
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # Базовый путь проекта
 BASE_DIR = Path(__file__).parent

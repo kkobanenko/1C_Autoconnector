@@ -4,7 +4,10 @@
 Получает метаданные таблиц, полей, первичных и внешних ключей.
 """
 
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+# В build_relationship_index: DISTINCT TOP N для висячих ключей (см. также sample_capped).
+RELATIONSHIP_INDEX_DISTINCT_SAMPLE_TOP = 50000
 import json
 import base64
 from pathlib import Path
@@ -33,7 +36,8 @@ class StructureAnalyzer:
         self._foreign_keys_cache: Dict[str, List[Dict]] = {}
         self._guid_to_table_cache: Optional[Dict[bytes, str]] = None  # Кэш GUID -> таблица
         self._relationship_index: Optional[Dict[str, Dict[str, List[str]]]] = None  # Индекс связей: {table → {field → [target_table, ...]}}
-        self._unresolved_fields: Optional[Dict[str, List[str]]] = None  # Висячие ключи: {table → [field, ...]}
+        # Висячие ключи: {table → {field → {distinct_in_sample, sample_capped}}}; после load старых JSON — миграция.
+        self._unresolved_fields: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
         self._field_stats_cache: Optional[Dict[str, Dict[str, dict]]] = None  # Кэш статистики полей
     
     def connect(self):
@@ -951,6 +955,34 @@ class StructureAnalyzer:
         time_estimate = n_queries * 0.05
         return n_tables, n_queries, time_estimate
 
+    @staticmethod
+    def _normalize_unresolved_for_memory(raw: Any) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """
+        Приводит unresolved из JSON к виду {table: {field: {distinct_in_sample, sample_capped}}}.
+        Старый формат: {table: [field, ...]} → distinct_in_sample=None (перестройте индекс).
+        """
+        if not raw or not isinstance(raw, dict):
+            return {}
+        out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for tbl, val in raw.items():
+            if isinstance(val, list):
+                out[tbl] = {
+                    str(f): {'distinct_in_sample': None, 'sample_capped': False}
+                    for f in val
+                }
+            elif isinstance(val, dict):
+                out[tbl] = {}
+                for fname, meta in val.items():
+                    fn = str(fname)
+                    if isinstance(meta, dict):
+                        out[tbl][fn] = {
+                            'distinct_in_sample': meta.get('distinct_in_sample'),
+                            'sample_capped': bool(meta.get('sample_capped', False)),
+                        }
+                    else:
+                        out[tbl][fn] = {'distinct_in_sample': None, 'sample_capped': False}
+        return out
+
     def build_relationship_index(
         self,
         guid_index: Optional[Dict[bytes, str]] = None,
@@ -1002,7 +1034,8 @@ class StructureAnalyzer:
                 tables_1c.append(table_simple)
 
         rel_index: Dict[str, Dict[str, List[str]]] = {}
-        unresolved_index: Dict[str, List[str]] = {}
+        unresolved_index: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        _top = RELATIONSHIP_INDEX_DISTINCT_SAMPLE_TOP
         total = len(tables_1c)
 
         for idx, table_name in enumerate(tables_1c):
@@ -1016,7 +1049,7 @@ class StructureAnalyzer:
 
                 schema, table = self._parse_table_name(normalized)
                 table_rels: Dict[str, List[str]] = {}
-                unresolved_fields: List[str] = []
+                unresolved_fields: Dict[str, Dict[str, Any]] = {}
 
                 for field_name in binary16_fields:
                     field_clean = field_name.lstrip('_')
@@ -1024,7 +1057,7 @@ class StructureAnalyzer:
                         continue
                     try:
                         query = (
-                            f"SELECT DISTINCT TOP 50000 [{field_name}] "
+                            f"SELECT DISTINCT TOP {_top} [{field_name}] "
                             f"FROM [{schema}].[{table}] "
                             f"WHERE [{field_name}] IS NOT NULL "
                             f"AND [{field_name}] != 0x00000000000000000000000000000000"
@@ -1057,7 +1090,11 @@ class StructureAnalyzer:
                             )
                             table_rels[field_name] = sorted_targets
                         elif has_data:
-                            unresolved_fields.append(field_name)
+                            n_distinct = len(rows)
+                            unresolved_fields[field_name] = {
+                                'distinct_in_sample': n_distinct,
+                                'sample_capped': n_distinct >= _top,
+                            }
                     except Exception:
                         continue
 
@@ -1085,9 +1122,9 @@ class StructureAnalyzer:
     def _save_relationship_index(
         self,
         rel_index: Dict[str, Dict[str, List[str]]],
-        unresolved: Optional[Dict[str, List[str]]] = None
+        unresolved: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
     ) -> bool:
-        """Сохраняет индекс связей на диск (version 2)."""
+        """Сохраняет индекс связей на диск (version 3: unresolved с метаданными выборки)."""
         try:
             from datetime import datetime
             host, database = self._parse_connection_params()
@@ -1097,7 +1134,7 @@ class StructureAnalyzer:
             ur_total = sum(len(v) for v in unresolved.values())
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump({
-                    'version': 2,
+                    'version': 3,
                     'metadata': {
                         'host': host,
                         'database': database,
@@ -1105,6 +1142,7 @@ class StructureAnalyzer:
                         'tables': len(rel_index),
                         'fields': total_fields,
                         'unresolved_fields': ur_total,
+                        'unresolved_distinct_sample_top': RELATIONSHIP_INDEX_DISTINCT_SAMPLE_TOP,
                     },
                     'index': rel_index,
                     'unresolved': unresolved,
@@ -1114,7 +1152,7 @@ class StructureAnalyzer:
             return False
 
     def _load_relationship_index(self) -> Optional[Dict[str, Dict[str, List[str]]]]:
-        """Загружает индекс связей с диска. Автоконвертация v1→v2."""
+        """Загружает индекс связей с диска. Автоконвертация v1→v2→v3 (unresolved)."""
         try:
             path = self._get_relationship_index_path()
             if not path.exists():
@@ -1137,7 +1175,7 @@ class StructureAnalyzer:
                         converted[table][field] = target
                     else:
                         converted[table][field] = [str(target)]
-            self._unresolved_fields = data.get('unresolved', {})
+            self._unresolved_fields = self._normalize_unresolved_for_memory(data.get('unresolved', {}))
             return converted
         except Exception:
             return None

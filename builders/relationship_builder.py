@@ -706,7 +706,10 @@ class RelationshipBuilder:
                     visited_keys.add(rk)
 
                     source_alias = _get_alias(src_table, current_table, field_name)
-                    target_alias = self._generate_table_alias(current_table, structure_parser)
+                    # Важно: тот же счётчик, что и для forward — иначе несколько reverse-рёбер
+                    # к одной current_table получают одинаковый target_alias и SQL даёт
+                    # «корреляционное имя задано несколько раз».
+                    target_alias = _get_alias(current_table, src_table, field_name)
 
                     results.append({
                         'source_table': src_table,

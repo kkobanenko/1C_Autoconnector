@@ -27,6 +27,7 @@ from builders.relationship_builder import RelationshipBuilder
 from generators.view_generator import ViewGenerator
 from utils.db_connection import test_connection, get_connection_string_from_params
 from utils.sidebar_context import render_context_sidebar
+from utils.config_scenarios import GEN_CONFIG_SCENARIO_OPTIONS, apply_scenario_by_id
 from analyzers.fact_table_assessor import FactTableAssessor
 from analyzers import fact_assessment_store as fact_assess_store
 from analyzers.field_filter import FieldFilter
@@ -1063,8 +1064,54 @@ _unresolved = getattr(analyzer, '_unresolved_fields', None) or {}
 if _unresolved:
     _ur_total = sum(len(v) for v in _unresolved.values())
     with st.expander(f"⚠️ Висячие ключи: {_ur_total} полей в {len(_unresolved)} таблицах", expanded=False):
-        for tbl, fields in sorted(_unresolved.items()):
-            st.text(f"  {tbl}: {', '.join(fields)}")
+        st.markdown(
+            "**Почему «висячий»:** в данных есть непустые GUID в поле `binary(16)`, но **ни один** из значений "
+            "в выборке `DISTINCT TOP ...` не найден в текущем **GUID-индексе**. Типичные причины: устаревший "
+            "или неполный GUID-индекс, удалённые объекты в БД, другая выгрузка/срез при построении индекса, "
+            "редко — нестандартные ссылки."
+        )
+        _ur_sp = st.session_state.get('gen_structure_parser')
+        _ur_sample_top = 50000
+        try:
+            from db.structure_analyzer import RELATIONSHIP_INDEX_DISTINCT_SAMPLE_TOP as _ur_top
+            _ur_sample_top = _ur_top
+        except Exception:
+            pass
+        _ur_rows = []
+        for tbl, fields_map in sorted(_unresolved.items()):
+            if not isinstance(fields_map, dict):
+                for fstr in (fields_map if isinstance(fields_map, list) else []):
+                    _ur_rows.append({
+                        "Таблица (техн.)": tbl,
+                        "Таблица (чел.)": (_ur_sp.get_table_human_name(tbl) if _ur_sp else None) or "—",
+                        "Поле (техн.)": fstr,
+                        "Поле (чел.)": (_ur_sp.get_field_human_name(tbl, fstr) if _ur_sp else None) or "—",
+                        "Уникальных в выборке": "н/д (старый индекс, перестройте)",
+                        "Потолок выборки": f"TOP {_ur_sample_top}",
+                    })
+                continue
+            for fname in sorted(fields_map.keys()):
+                meta = fields_map[fname] if isinstance(fields_map[fname], dict) else {}
+                _n = meta.get('distinct_in_sample')
+                _cap = bool(meta.get('sample_capped', False))
+                if _n is None:
+                    _dist_s = "н/д (старый формат файла — перестройте индекс связей)"
+                elif _cap:
+                    _dist_s = f"≥ {_n} (достигнут TOP {_ur_sample_top}; реальных DISTINCT может быть больше)"
+                else:
+                    _dist_s = str(_n)
+                _ur_rows.append({
+                    "Таблица (техн.)": tbl,
+                    "Таблица (чел.)": (_ur_sp.get_table_human_name(tbl) if _ur_sp else None) or "—",
+                    "Поле (техн.)": fname,
+                    "Поле (чел.)": (_ur_sp.get_field_human_name(tbl, fname) if _ur_sp else None) or "—",
+                    "Уникальных в выборке": _dist_s,
+                    "Потолок выборки": f"TOP {_ur_sample_top}",
+                })
+        if _ur_rows:
+            st.dataframe(_ur_rows, use_container_width=True, hide_index=True)
+        if not _ur_sp:
+            st.caption("Человекочитаемые имена появятся после загрузки файла структуры (ниже по странице) и нового открытия этого блока.")
 
 st.markdown("---")
 
@@ -1222,7 +1269,17 @@ if _fs_loaded and analyzer._field_stats_cache:
                         _linked = ", ".join(_targets)
                     elif _is_binary16:
                         _ur = getattr(analyzer, '_unresolved_fields', None) or {}
-                        _is_hanging = fname in (_ur.get(_fs_selected, []))
+                        _ur_tbl = _ur.get(_fs_selected) or _ur.get(
+                            analyzer._normalize_table_name(_fs_selected)
+                            if hasattr(analyzer, '_normalize_table_name') else _fs_selected,
+                            {},
+                        )
+                        if isinstance(_ur_tbl, dict):
+                            _is_hanging = fname in _ur_tbl
+                        elif isinstance(_ur_tbl, list):
+                            _is_hanging = fname in _ur_tbl
+                        else:
+                            _is_hanging = False
                         _linked = "🔑 висячий" if (_is_hanging and not is_junk) else "—"
                     else:
                         _linked = ""
@@ -2457,6 +2514,46 @@ def _render_config_section():
     st.header("10. 🗂️ Настройка таблиц и связей")
     st.caption(f"Найдено {len(relationships)} связей. Отключите ненужные таблицы/поля или измените тип JOIN.")
 
+    with st.expander("📋 Автоматические сценарии создания конфигураций", expanded=False):
+        st.caption(
+            "Шаблон для первичного заполнения включённых связей и списка полей. "
+            "После применения всё можно править вручную, сохранить в cfg и сгенерировать SQL."
+        )
+        if not relationships:
+            st.warning("Сначала постройте или загрузите граф связей.")
+        else:
+            _sc_titles = {s["id"]: s["title"] for s in GEN_CONFIG_SCENARIO_OPTIONS}
+            _sc_ids = [s["id"] for s in GEN_CONFIG_SCENARIO_OPTIONS]
+            _scenario_pick = st.selectbox(
+                "Сценарий",
+                options=_sc_ids,
+                format_func=lambda x: _sc_titles.get(x, x),
+                key="gen_cfg_scenario_pick",
+            )
+            _sc_meta = next((s for s in GEN_CONFIG_SCENARIO_OPTIONS if s["id"] == _scenario_pick), None)
+            if _sc_meta:
+                st.caption(_sc_meta["description"])
+            if st.button("Применить сценарий", type="primary", key="gen_cfg_scenario_apply"):
+                _tc_before = dict(st.session_state.get("gen_table_config") or {})
+                _n_tc, _n_excl, _sc_err = apply_scenario_by_id(
+                    _scenario_pick,
+                    analyzer,
+                    selected_table_db,
+                    relationships,
+                    _tc_before,
+                )
+                if _sc_err:
+                    st.error(_sc_err)
+                else:
+                    st.session_state.gen_table_config = _n_tc
+                    st.session_state.gen_excluded_fields = _n_excl
+                    st.session_state._pending_cfg_load = {
+                        "table_config": _n_tc,
+                        "excluded_fields": _n_excl,
+                    }
+                    st.success("Сценарий применён. При необходимости уточните связи, JOIN и поля.")
+                    st.rerun()
+
     def _is_field_visible_for_display(table_name, field_name):
         """Поле показывается в форме, если оно не мусорное ИЛИ включён показ мусорных (чекбокс в блоке «Фильтрация»)."""
         if st.session_state.get('gen_show_junk_fields', False):
@@ -2838,6 +2935,77 @@ def _render_config_section():
 
     # Словарь rk → rel для быстрого поиска связи по ключу (нужен для отображения пути)
     _rk_to_rel = {r['relationship_key']: r for r in relationships}
+
+    def _nav_path_segments_for_trk(trk: str):
+        """Первый вариант пути к целевому ребру trk: список rks, cum, ур., длина пути."""
+        variants = _rel_key_path_variants.get(trk) or []
+        if variants:
+            v0 = variants[0]
+            pr = list(v0.get('path_rks') or [trk])
+            return pr, v0.get('cum') or {}, v0.get('level', 0), v0.get('path_length', len(pr))
+        tr = _rk_to_rel.get(trk)
+        if tr:
+            sd, su = tr.get('steps_down', 0), tr.get('steps_up', 0)
+            return [trk], {trk: (sd, su)}, sd - su, sd + su
+        return [trk], {}, 0, 0
+
+    def _format_nav_target_compact(trk: str) -> str:
+        """
+        Одна строка для selectbox «цель» при навигации по ref16:
+        целевая таблица + компактная цепочка шагов от корня (как вариант пути в узле).
+        """
+        tr = _rk_to_rel.get(trk)
+        if not tr:
+            return str(trk)
+        t_tbl = tr['target_table'] if tr.get('direction') == 'forward' else tr['source_table']
+        t_h = sp.get_table_human_name(t_tbl) if sp else None
+        title = f"{t_h} ({t_tbl})" if t_h else t_tbl
+        path_rks, _v_cum, lev, plen = _nav_path_segments_for_trk(trk)
+
+        def _short_tb(tb: str, max_len: int = 26) -> str:
+            if len(tb) <= max_len:
+                return tb
+            return tb[: max_len - 1] + "…"
+
+        hop_parts = []
+        for edge_rk in path_rks:
+            er = _rk_to_rel.get(edge_rk)
+            if not er:
+                continue
+            arrow = "→" if er.get('direction') == 'forward' else "←"
+            sts, tts = er['source_table'], er['target_table']
+            hf = sp.get_field_human_name(er['source_table'], er['field_name']) if sp else None
+            fld = hf or er['field_name']
+            hop_parts.append(f"{_short_tb(sts)}.{fld}{arrow}{_short_tb(tts)}")
+        if not hop_parts:
+            return title
+        max_hops_show = 4
+        if len(hop_parts) > max_hops_show:
+            chain = hop_parts[0] + " … " + hop_parts[-1]
+        else:
+            chain = " · ".join(hop_parts)
+        suffix = f" [ур.{lev} дп.{plen}]"
+        full = f"{title} — {chain}{suffix}"
+        if len(full) > 130:
+            full = full[:127] + "…"
+        return full
+
+    def _format_nav_target_detail(trk: str) -> str:
+        """Полный путь от корня — для caption под selectbox (многострочный)."""
+        path_rks, v_cum, _, _ = _nav_path_segments_for_trk(trk)
+        lines = []
+        for i, edge_rk in enumerate(path_rks, start=1):
+            er = _rk_to_rel.get(edge_rk)
+            if not er:
+                continue
+            arrow = "→" if er.get('direction') == 'forward' else "←"
+            _esd, _esu = v_cum.get(edge_rk, (er.get('steps_down', 0), er.get('steps_up', 0)))
+            edge_steps = f" (↓{_esd} ↑{_esu})" if (_esd or _esu) else ""
+            lines.append(
+                f"{i}. `{er['source_table']}`.`{er['field_name']}` {arrow} "
+                f"`{er['target_table']}`{edge_steps}"
+            )
+        return "\n".join(lines) if lines else ""
 
     def _enumerate_rel_key_path_codes():
         """
@@ -3255,11 +3423,10 @@ def _render_config_section():
                                             for trk in target_rks:
                                                 tr = _rk_to_rel.get(trk)
                                                 if tr:
-                                                    t_tbl = tr['target_table'] if tr.get('direction') == 'forward' else tr['source_table']
-                                                    t_h = sp.get_table_human_name(t_tbl) if sp else ''
-                                                    _nav_opts.append((f"{t_h} ({t_tbl})" if t_h else t_tbl, trk))
+                                                    _lbl = _format_nav_target_compact(trk)
+                                                    _nav_opts.append((_lbl, trk))
                                                 else:
-                                                    _nav_opts.append((trk, trk))
+                                                    _nav_opts.append((str(trk), trk))
                                             _sel_labels = [o[0] for o in _nav_opts]
                                             _chosen_idx = st.selectbox(
                                                 "Цель", range(len(_sel_labels)),
@@ -3268,6 +3435,9 @@ def _render_config_section():
                                                 label_visibility="collapsed"
                                             )
                                             _chosen_rk = _nav_opts[_chosen_idx][1]
+                                            _nav_det = _format_nav_target_detail(_chosen_rk)
+                                            if _nav_det:
+                                                st.caption("Путь от корня:\n" + _nav_det)
                                         with btn_col:
                                             if st.button("→", key=f"nav_to_{rk}_{cname}", help="Перейти к настройке таблицы"):
                                                 _expanded_nodes.add(_chosen_rk)
@@ -3705,11 +3875,10 @@ def _render_config_section():
                                 for trk in target_rks:
                                     tr = _rk_to_rel.get(trk)
                                     if tr:
-                                        t_tbl = tr['target_table'] if tr.get('direction') == 'forward' else tr['source_table']
-                                        t_h = sp.get_table_human_name(t_tbl) if sp else ''
-                                        _nav_opts_r.append((f"{t_h} ({t_tbl})" if t_h else t_tbl, trk))
+                                        _lbl_r = _format_nav_target_compact(trk)
+                                        _nav_opts_r.append((_lbl_r, trk))
                                     else:
-                                        _nav_opts_r.append((trk, trk))
+                                        _nav_opts_r.append((str(trk), trk))
                                 _sel_labels_r = [o[0] for o in _nav_opts_r]
                                 _chosen_idx_r = st.selectbox(
                                     "Цель", range(len(_sel_labels_r)),
@@ -3718,6 +3887,9 @@ def _render_config_section():
                                     label_visibility="collapsed"
                                 )
                                 _chosen_rk_r = _nav_opts_r[_chosen_idx_r][1]
+                                _nav_det_r = _format_nav_target_detail(_chosen_rk_r)
+                                if _nav_det_r:
+                                    st.caption("Путь от корня:\n" + _nav_det_r)
                             with btn_col:
                                 if st.button("→", key=f"nav_to_{_root_key}_{cname}", help="Перейти к настройке таблицы"):
                                     _expanded_nodes = set(st.session_state.get('_config_expanded_nodes', set()))
@@ -4764,6 +4936,18 @@ if st.session_state.gen_graph_built and st.session_state.gen_relationships_colle
                         max_depth_up=_mdu,
                         paths_from_root=_paths if _paths else None
                     )
+
+                    _trunc_rep = getattr(vg, "last_sql_truncation_report", None)
+                    if _trunc_rep and _trunc_rep.get("truncated"):
+                        st.warning(_trunc_rep.get("summary_message", "Часть полей отсечена от VIEW (лимит 1024 столбца)."))
+                    elif (
+                        output_format_code == "select"
+                        and getattr(vg, "last_select_exceeds_view_limit", False)
+                    ):
+                        st.warning(
+                            "Сгенерированный SELECT содержит более 1024 столбцов — такой запрос нельзя целиком "
+                            "обернуть в CREATE VIEW в SQL Server. Текст без обрезки; см. комментарий в шапке .sql."
+                        )
 
                     st.session_state.gen_generated_sql = sql
 

@@ -35,6 +35,9 @@ temp/
 *.log
 *.bak
 
+# Локальные артефакты автоматизации браузера (MCP Playwright)
+.playwright-mcp/
+
 # Environment variables (if any)
 .env
 .env.local

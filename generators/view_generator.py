@@ -15,7 +15,8 @@
 
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+from collections import Counter, defaultdict
 from db.structure_analyzer import StructureAnalyzer
 from builders.relationship_builder import RelationshipBuilder
 from parsers.structure_parser import StructureParser
@@ -24,6 +25,11 @@ from parsers.structure_parser import StructureParser
 _ALLOWED_SQL_JOIN_TYPES = frozenset({
     'INNER JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'FULL OUTER JOIN',
 })
+
+# Лимит SQL Server на число столбцов в одном VIEW (ошибка 4505 при превышении).
+SQL_SERVER_VIEW_MAX_COLUMNS = 1024
+# В комментариях SQL не перечислять больше строк на таблицу (остальное — «ещё K»).
+_TRUNCATION_COMMENT_MAX_PER_TABLE = 50
 
 
 class ViewGenerator:
@@ -59,6 +65,10 @@ class ViewGenerator:
         self.alias_counter: Dict[str, int] = {}  # Счетчик для создания уникальных алиасов
         self.table_config: Optional[Dict[str, Dict]] = None  # Конфигурация таблиц: {relationship_key: {enabled: bool, join_type: str}}
         self.naming_style: str = 'classic'  # Стиль именования: 'classic' | 'dotted'
+        # После generate_view / generate_view_from_relationships: отчёт об обрезке до SQL_SERVER_VIEW_MAX_COLUMNS (для UI).
+        self.last_sql_truncation_report: Optional[Dict[str, Any]] = None
+        # Только SELECT: число столбцов > лимита VIEW — предупреждение в шапке SQL и опционально в UI.
+        self.last_select_exceeds_view_limit: bool = False
     
     def collect_all_relationships(
         self,
@@ -331,8 +341,13 @@ class ViewGenerator:
         self.naming_style = naming_style
         self.joins = []
         self.selected_fields = []
+        self.last_sql_truncation_report = None
+        self.last_select_exceeds_view_limit = False
         self.table_aliases = {}
         used_column_aliases: Set[str] = set()
+        # Алиасы таблиц в FROM/JOIN должны быть глобально уникальны (в т.ч. при коллизии
+        # после замены символов в имени или при расхождении логики графа и счётчиков).
+        used_join_aliases: Set[str] = set()
 
         # Нормализуем excluded_fields: значения могут быть set или list (из JSON)
         _excl: Dict[str, Set[str]] = {}
@@ -382,6 +397,7 @@ class ViewGenerator:
             root_aliases = {main_alias}
         main_alias = next(iter(root_aliases))
         self.table_aliases[fact_table_db] = main_alias
+        used_join_aliases.add(main_alias)
 
         # DFS-порядок связей (как в UI). Включаем транзитные связи — путь к включённым таблицам.
         def _build_dfs_order():
@@ -505,8 +521,11 @@ class ViewGenerator:
             while alias in used_column_aliases:
                 alias = f"{base_alias}_{suffix}"
                 suffix += 1
-            used_column_aliases.add(alias)
+                used_column_aliases.add(alias)
             return alias
+
+        # Накопление строк SELECT с метаданными (порядок = порядок во VIEW при обрезке).
+        select_rows: List[Dict[str, str]] = []
 
         def _add_fields_for_table(
             table_name: str,
@@ -547,21 +566,13 @@ class ViewGenerator:
                     )
                 else:
                     field_expr = f"{field_ref} AS [{field_alias}]"
-                self.selected_fields.append(field_expr)
-
-        def _get_pk_column(table_name: str) -> str:
-            """Возвращает имя колонки первичного ключа таблицы."""
-            pk_cols = self.analyzer.get_primary_keys(table_name)
-            if pk_cols:
-                return pk_cols[0]
-            cols = self.analyzer.get_table_columns(table_name)
-            for c in cols:
-                if c['name'] in ['_IDRRef', 'IDRRef', '_ID', 'ID']:
-                    return c['name']
-            for c in cols:
-                if c['name'].endswith('_IDRRef') or c['name'].endswith('IDRRef'):
-                    return c['name']
-            return 'ID'
+                select_rows.append({
+                    "expr": field_expr,
+                    "table_db": table_name,
+                    "col_tech": col_name,
+                    "output_alias": field_alias,
+                    "excl_key": excl_key,
+                })
 
         # Поля корневой таблицы
         root_key = f"__root__{fact_table_db}"
@@ -595,6 +606,14 @@ class ViewGenerator:
                 existing_table = target_table
                 existing_alias = target_alias
 
+            # Гарантируем уникальность корреляционного имени в SQL (дубликаты ломают SELECT).
+            _base_alias = new_alias
+            _suf = 2
+            while new_alias in used_join_aliases:
+                new_alias = f"{_base_alias}_{_suf}"
+                _suf += 1
+            used_join_aliases.add(new_alias)
+
             # Используем алиас родительской таблицы из table_aliases, если она уже присоединена.
             # build_mixed_graph может выдавать разные алиасы для одной таблицы (напр. _2),
             # поэтому source_alias/target_alias из связи может не совпадать с уже добавленным.
@@ -610,14 +629,14 @@ class ViewGenerator:
             # Для обратных связей: field_name — FK в потомке (new_table), родитель — по PK.
             # Для прямых: field_name — FK в родителе (existing), потомок — по PK.
             if direction == 'reverse':
-                parent_pk = _get_pk_column(existing_table)
+                parent_pk = self._resolve_pk_column_for_join(existing_table)
                 schema, tbl = self.analyzer._parse_table_name(new_table)
                 join_sql = (
                     f"{join_type} [{schema}].[{tbl}] AS [{new_alias}] "
                     f"ON [{alias_for_join}].[{parent_pk}] = [{new_alias}].[{field_name}]"
                 )
             else:
-                pk_col = _get_pk_column(new_table)
+                pk_col = self._resolve_pk_column_for_join(new_table)
                 schema, tbl = self.analyzer._parse_table_name(new_table)
                 join_sql = (
                     f"{join_type} [{schema}].[{tbl}] AS [{new_alias}] "
@@ -631,7 +650,7 @@ class ViewGenerator:
             if rk not in transit_only_rks:
                 _add_fields_for_table(new_table, new_alias, rk, is_root=False)
 
-        if not self.selected_fields:
+        if not select_rows:
             raise ValueError(
                 "Нет выбранных полей. Включите хотя бы одну связь и отметьте поля в настройке таблиц."
             )
@@ -639,13 +658,6 @@ class ViewGenerator:
         if view_name is None:
             human_name = self.structure_parser.get_table_human_name(fact_table_db)
             view_name = ("vw_" + human_name.replace('.', '_').replace(' ', '_')) if human_name else f"vw_{fact_table_db.lstrip('_')}"
-
-        select_body = "SELECT\n" + ",\n".join("    " + f for f in self.selected_fields)
-        select_body += f"\nFROM "
-        schema, table = self.analyzer._parse_table_name(fact_table_db)
-        select_body += f"[{schema}].[{table}] AS [{main_alias}]\n"
-        if self.joins:
-            select_body += "\n".join(self.joins)
 
         # Собираем таблицы и выбранные поля для заголовка (только где выбрано хотя бы одно)
         def _sel_cols(cols_list, excl_set):
@@ -668,17 +680,15 @@ class ViewGenerator:
             if sel:
                 tables_with_selected[tgt] = sel
 
-        header = self._generate_header(
-            fact_table_db, view_name, len(sorted_rels),
-            tables_with_selected=tables_with_selected
+        return self._compose_sql_output_with_view_limit(
+            select_rows=select_rows,
+            fact_table_db=fact_table_db,
+            main_alias=main_alias,
+            view_name=view_name,
+            header_depth_metric=len(sorted_rels),
+            output_format=output_format,
+            tables_with_selected=tables_with_selected,
         )
-        if output_format == 'select':
-            return header + select_body
-        elif output_format == 'both':
-            view_sql = f"CREATE OR ALTER VIEW [{view_name}] AS\n{select_body}"
-            sep = "\n\nGO\n\n" + "-- " + "=" * 60 + "\n-- Чистый SELECT запрос (без создания VIEW)\n-- " + "=" * 60 + "\n\n"
-            return header + view_sql + sep + select_body
-        return header + f"CREATE OR ALTER VIEW [{view_name}] AS\n{select_body}"
 
     def generate_view(
         self,
@@ -710,6 +720,8 @@ class ViewGenerator:
         # Очищаем структуры
         self.joins = []
         self.selected_fields = []
+        self._select_field_rows: List[Dict[str, str]] = []
+        self.last_sql_truncation_report = None
         self.table_aliases = {}
         self.alias_counter = {}
         
@@ -742,35 +754,184 @@ class ViewGenerator:
                 view_name = "vw_" + human_name.replace('.', '_').replace(' ', '_')
             else:
                 view_name = f"vw_{fact_table_db.lstrip('_')}"
-        
-        # Формируем тело запроса (SELECT + FROM + JOINs)
-        select_body = "SELECT\n"
-        select_body += ",\n".join("    " + field for field in self.selected_fields)
+
+        rows = self._select_field_rows
+        if len(rows) != len(self.selected_fields):
+            rows = [
+                {
+                    "expr": e,
+                    "table_db": "",
+                    "col_tech": "",
+                    "output_alias": "",
+                    "excl_key": "",
+                }
+                for e in self.selected_fields
+            ]
+
+        return self._compose_sql_output_with_view_limit(
+            select_rows=rows,
+            fact_table_db=fact_table_db,
+            main_alias=main_alias,
+            view_name=view_name,
+            header_depth_metric=max_depth,
+            output_format=output_format,
+            tables_with_selected=None,
+        )
+    
+    def _select_body_from_rows(
+        self,
+        rows: List[Dict[str, str]],
+        main_alias: str,
+        fact_table_db: str,
+    ) -> str:
+        """Собирает SELECT ... FROM ... JOIN из списка элементов с ключом 'expr'."""
+        exprs = [r["expr"] for r in rows]
+        select_body = "SELECT\n" + ",\n".join("    " + f for f in exprs)
         select_body += "\nFROM "
         schema, table = self.analyzer._parse_table_name(fact_table_db)
         select_body += f"[{schema}].[{table}] AS [{main_alias}]\n"
         if self.joins:
             select_body += "\n".join(self.joins)
-        
-        # Заголовок с метаданными
-        header = self._generate_header(fact_table_db, view_name, max_depth)
-        
-        # Формируем итоговый SQL в зависимости от формата
-        if output_format == 'select':
-            return header + select_body
-        elif output_format == 'both':
-            view_sql = f"CREATE OR ALTER VIEW [{view_name}] AS\n{select_body}"
-            separator = "\n\nGO\n\n" + "-- " + "=" * 60 + "\n-- Чистый SELECT запрос (без создания VIEW)\n-- " + "=" * 60 + "\n\n"
-            return header + view_sql + separator + select_body
-        else:  # 'view'
-            return header + f"CREATE OR ALTER VIEW [{view_name}] AS\n{select_body}"
-    
+        return select_body
+
+    def _omitted_field_comment_lines(self, omitted: List[Dict[str, str]]) -> List[str]:
+        """Комментарии с перечнем полей, не попавших во VIEW."""
+        if not omitted:
+            return []
+        max_pt = _TRUNCATION_COMMENT_MAX_PER_TABLE
+        by_tbl: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+        for r in omitted:
+            by_tbl[r["table_db"]].append(r)
+        lines = [
+            "-- ────────────────────────────────────────────────────────",
+            "-- Поля, не вошедшие во VIEW (лимит SQL Server 1024 столбца):",
+            "-- ────────────────────────────────────────────────────────",
+        ]
+        for tbl in sorted(by_tbl.keys(), key=lambda t: (-len(by_tbl[t]), t)):
+            trows = by_tbl[tbl]
+            th = self.structure_parser.get_table_human_name(tbl) or tbl
+            lines.append(f"-- Таблица «{th}» ({tbl}) — отброшено: {len(trows)}")
+            show = trows[:max_pt]
+            for r in show:
+                lines.append(f"--   {r['col_tech']}  →  результирующее имя [{r['output_alias']}]")
+            if len(trows) > max_pt:
+                lines.append(f"--   ... ещё {len(trows) - max_pt} полей из этой таблицы")
+        lines.append("-- ────────────────────────────────────────────────────────")
+        return lines
+
+    def _make_truncation_report(
+        self,
+        omitted: List[Dict[str, str]],
+        view_n: int,
+        full_n: int,
+    ) -> Dict[str, Any]:
+        """Сводка для st.warning и отладки (после обрезки VIEW)."""
+        cnt = Counter(r["table_db"] for r in omitted)
+        top = cnt.most_common(20)
+        top_tables: List[Dict[str, Any]] = []
+        summary_parts: List[str] = []
+        for tbl, n in top[:8]:
+            th = self.structure_parser.get_table_human_name(tbl) or tbl
+            top_tables.append({"table": tbl, "count": n, "human": th})
+            summary_parts.append(f"{th}: {n}")
+        msg = (
+            f"Во VIEW включено {view_n} из {full_n} столбцов. "
+            f"Отсечено от VIEW: {len(omitted)}. "
+            f"Топ таблиц по числу отсечённых полей: {', '.join(summary_parts)}"
+        )
+        return {
+            "truncated": True,
+            "omitted_count": len(omitted),
+            "view_column_count": view_n,
+            "full_column_count": full_n,
+            "top_tables": top_tables,
+            "summary_message": msg,
+        }
+
+    def _compose_sql_output_with_view_limit(
+        self,
+        *,
+        select_rows: List[Dict[str, str]],
+        fact_table_db: str,
+        main_alias: str,
+        view_name: str,
+        header_depth_metric: int,
+        output_format: str,
+        tables_with_selected: Optional[Dict[str, List[str]]] = None,
+    ) -> str:
+        """
+        Формирует итоговый SQL с учётом лимита столбцов VIEW.
+        Для 'view' и 'both' тело CREATE VIEW обрезается до SQL_SERVER_VIEW_MAX_COLUMNS.
+        Для 'both' второй SELECT (после GO) — полный. Для 'select' обрезки нет; при N>1024 — предупреждение в шапке.
+        """
+        n_full = len(select_rows)
+        self.selected_fields = [r["expr"] for r in select_rows]
+
+        self.last_sql_truncation_report = None
+        need_truncate_view = output_format in ("view", "both") and n_full > SQL_SERVER_VIEW_MAX_COLUMNS
+        view_rows = (
+            select_rows[:SQL_SERVER_VIEW_MAX_COLUMNS] if need_truncate_view else select_rows
+        )
+        omitted = select_rows[len(view_rows) :] if need_truncate_view else []
+
+        if need_truncate_view and omitted:
+            self.last_sql_truncation_report = self._make_truncation_report(
+                omitted, len(view_rows), n_full
+            )
+
+        select_body_full = self._select_body_from_rows(
+            select_rows, main_alias, fact_table_db
+        )
+        select_body_view = self._select_body_from_rows(
+            view_rows, main_alias, fact_table_db
+        )
+
+        trunc_lines = self._omitted_field_comment_lines(omitted)
+        warn_select_only = output_format == "select" and n_full > SQL_SERVER_VIEW_MAX_COLUMNS
+        if warn_select_only:
+            self.last_select_exceeds_view_limit = True
+
+        # В шапке «во VIEW» — только если реально генерируется обрезанный VIEW.
+        col_view = len(view_rows) if need_truncate_view else None
+        col_full = n_full if need_truncate_view else None
+
+        header = self._generate_header(
+            fact_table_db,
+            view_name,
+            header_depth_metric,
+            tables_with_selected=tables_with_selected,
+            column_count_in_view=col_view,
+            column_count_full_select=col_full,
+            truncation_comment_lines=trunc_lines if trunc_lines else None,
+            warn_select_exceeds_view_limit=warn_select_only,
+            note_view_vs_full_select=output_format == "both" and need_truncate_view,
+        )
+
+        if output_format == "select":
+            return header + select_body_full
+        if output_format == "both":
+            view_sql = f"CREATE OR ALTER VIEW [{view_name}] AS\n{select_body_view}"
+            sep = (
+                "\n\nGO\n\n"
+                + "-- " + "=" * 60 + "\n"
+                + "-- Чистый SELECT запрос (без создания VIEW), полный список столбцов\n"
+                + "-- " + "=" * 60 + "\n\n"
+            )
+            return header + view_sql + sep + select_body_full
+        return header + f"CREATE OR ALTER VIEW [{view_name}] AS\n{select_body_view}"
+
     def _generate_header(
         self,
         fact_table_db: str,
         view_name: str,
         max_depth: int,
-        tables_with_selected: Optional[Dict[str, List[str]]] = None
+        tables_with_selected: Optional[Dict[str, List[str]]] = None,
+        *,
+        column_count_in_view: Optional[int] = None,
+        column_count_full_select: Optional[int] = None,
+        truncation_comment_lines: Optional[List[str]] = None,
+        warn_select_exceeds_view_limit: bool = False,
+        note_view_vs_full_select: bool = False,
     ) -> str:
         """Генерирует заголовок с метаданными."""
         human_name = self.structure_parser.get_table_human_name(fact_table_db) or fact_table_db
@@ -781,10 +942,37 @@ class ViewGenerator:
             f"-- Таблица фактов: {human_name} ({fact_table_db})",
             f"-- Глубина JOIN: {max_depth}",
             f"-- Количество JOIN: {len(self.joins)}",
-            f"-- Количество полей: {len(self.selected_fields)}",
         ]
+        if column_count_in_view is not None:
+            lines.append(f"-- Количество полей во VIEW: {column_count_in_view}")
+        else:
+            lines.append(f"-- Количество полей: {len(self.selected_fields)}")
+        if (
+            column_count_full_select is not None
+            and column_count_in_view is not None
+            and column_count_full_select > column_count_in_view
+        ):
+            lines.append(
+                f"-- Полный SELECT (все выбранные поля): {column_count_full_select}"
+            )
+            lines.append(
+                f"-- Отсечено от VIEW из‑за лимита SQL Server: "
+                f"{column_count_full_select - column_count_in_view}"
+            )
+        if note_view_vs_full_select:
+            lines.append(
+                "-- В этом файле блок CREATE VIEW содержит не более 1024 столбцов; "
+                "ниже после GO — полный SELECT со всеми столбцами."
+            )
+        if warn_select_exceeds_view_limit:
+            lines.append(
+                "-- ВНИМАНИЕ: число столбцов > 1024 — весь этот SELECT нельзя обернуть "
+                "в одно представление CREATE VIEW в SQL Server (лимит 1024 столбца на VIEW)."
+            )
+        if truncation_comment_lines:
+            lines.extend(truncation_comment_lines)
         if tables_with_selected is not None and tables_with_selected:
-            lines.append("-- Таблицы и выбранные поля:")
+            lines.append("-- Таблицы и выбранные поля (по конфигурации, до обрезки VIEW):")
             for tbl, fields in tables_with_selected.items():
                 t_human = self.structure_parser.get_table_human_name(tbl) or tbl
                 lines.append(f"--   {t_human} ({tbl}): {', '.join(fields)}")
@@ -794,6 +982,101 @@ class ViewGenerator:
         ])
         return "\n".join(lines) + "\n"
     
+    def _resolve_pk_column_for_join(self, target_table: str) -> str:
+        """
+        Имя колонки на стороне присоединяемой таблицы для условия JOIN (для типовых таблиц 1С — _IDRRef).
+        Возвращает только реально существующее поле; не подставляет «ID», если колонки нет в метаданных.
+
+        Логика совпадает с веткой JOIN в _process_relationship, чтобы путь generate_view_from_relationships
+        не использовал упрощённый fallback.
+        """
+        target_columns = self.analyzer.get_table_columns(target_table)
+        if not target_columns:
+            raise ValueError(
+                f"[ViewGenerator] Нет колонок в метаданных для таблицы {target_table!r} (JOIN к ключу невозможен)."
+            )
+        name_set = {c['name'] for c in target_columns}
+
+        pk_columns = self.analyzer.get_primary_keys(target_table)
+        if pk_columns:
+            for pk in pk_columns:
+                if pk in name_set:
+                    return pk
+
+        is_tabular_part = '_VT' in target_table
+        if is_tabular_part:
+            table_parts = target_table.split('_VT', 1)
+            main_table_name = table_parts[0] if table_parts else ''
+            if main_table_name:
+                expected_pk_name = f"{main_table_name}_IDRRef"
+                idrref_fields: List[str] = []
+                pk_column: Optional[str] = None
+                for col in target_columns:
+                    col_name = col['name']
+                    col_type = col['data_type']
+                    col_max_length = col.get('max_length')
+                    if col_type in ['binary', 'varbinary'] and col_max_length == 16:
+                        if (
+                            col_name == '_IDRRef'
+                            or col_name == 'IDRRef'
+                            or col_name.endswith('_IDRRef')
+                            or col_name.endswith('IDRRef')
+                        ):
+                            idrref_fields.append(col_name)
+                            if col_name == expected_pk_name:
+                                pk_column = col_name
+                                break
+                if pk_column:
+                    return pk_column
+                if idrref_fields:
+                    return idrref_fields[0]
+
+        for std_name in ('_IDRRef', 'IDRRef', '_ID', 'ID'):
+            if std_name in name_set:
+                return std_name
+
+        for col in target_columns:
+            cn = col['name']
+            if cn.endswith('_IDRRef') or cn.endswith('IDRRef'):
+                return cn
+
+        idrref_fields2: List[str] = []
+        for col in target_columns:
+            col_name = col['name']
+            col_type = col['data_type']
+            col_max_length = col.get('max_length')
+            if col_type in ['binary', 'varbinary'] and col_max_length == 16:
+                if (
+                    col_name == '_IDRRef'
+                    or col_name == 'IDRRef'
+                    or col_name.endswith('_IDRRef')
+                    or col_name.endswith('IDRRef')
+                ):
+                    idrref_fields2.append(col_name)
+        if idrref_fields2:
+            return idrref_fields2[0]
+
+        # Таблицы перечислений 1С в БД: ключ ссылочного соответствия — порядок в перечислении.
+        if target_table.startswith('_Enum') and '_EnumOrder' in name_set:
+            return '_EnumOrder'
+
+        # Регистрация изменений / прочие служебные: ссылка не всегда заканчивается на IDRRef (_NodeTRef, *_RRef).
+        for col in target_columns:
+            col_name = col['name']
+            col_type = col['data_type']
+            col_max_length = col.get('max_length')
+            if col_type in ['binary', 'varbinary'] and col_max_length == 16:
+                if col_name == '_NodeTRef' or 'RRef' in col_name:
+                    return col_name
+
+        sample = sorted(name_set)
+        if len(sample) > 48:
+            sample = sample[:48] + ['...']
+        raise ValueError(
+            f"[ViewGenerator] Не удалось определить колонку ключа для JOIN с {target_table!r}. "
+            f"Доступные колонки: {sample}"
+        )
+
     def _add_table_fields(
         self,
         table_name: str,
@@ -863,9 +1146,16 @@ class ViewGenerator:
                 )
             else:
                 field_expr = f"{field_ref} AS [{field_alias}]"
-            
+
             self.selected_fields.append(field_expr)
-    
+            self._select_field_rows.append({
+                "expr": field_expr,
+                "table_db": table_name,
+                "col_tech": col_name,
+                "output_alias": field_alias,
+                "excl_key": f"__legacy__{table_name}",
+            })
+
     def _process_relationship(
         self,
         source_table: str,
@@ -925,81 +1215,7 @@ class ViewGenerator:
         # Сохраняем алиас
         self.table_aliases[target_table] = target_alias
         
-        # Получаем первичный ключ целевой таблицы
-        # Для табличных частей нужно искать поле, которое равно или заканчивается на _IDRRef
-        pk_columns = self.analyzer.get_primary_keys(target_table)
-        pk_column = None
-        
-        if pk_columns:
-            pk_column = pk_columns[0]
-        else:
-            # Если PK не найден, ищем поле по правилам для 1С
-            target_columns = self.analyzer.get_table_columns(target_table)
-            
-            # Проверяем, является ли таблица табличной частью (содержит _VT)
-            is_tabular_part = '_VT' in target_table
-            
-            if is_tabular_part:
-                # Для табличных частей определяем имя основной таблицы
-                # Например, _Reference193_VT30459 -> _Reference193
-                # Разделяем по _VT (табличные части всегда имеют формат TableName_VTNumber)
-                table_parts = target_table.split('_VT', 1)  # Разделяем только по первому вхождению
-                if table_parts and len(table_parts) > 0:
-                    main_table_name = table_parts[0]  # _Reference193
-                    
-                    # Ищем поле вида _Reference193_IDRRef или заканчивающееся на _IDRRef
-                    # Сначала ищем точное совпадение с именем основной таблицы
-                    expected_pk_name = f"{main_table_name}_IDRRef"
-                    
-                    # Ищем поля binary(16), которые равны или заканчиваются на _IDRRef или IDRRef
-                    idrref_fields = []
-                    for col in target_columns:
-                        col_name = col['name']
-                        col_type = col['data_type']
-                        col_max_length = col.get('max_length')
-                        
-                        # Проверяем, что это binary(16) или varbinary(16)
-                        if col_type in ['binary', 'varbinary'] and col_max_length == 16:
-                            # Проверяем, что поле равно или заканчивается на _IDRRef или IDRRef
-                            if (col_name == '_IDRRef' or 
-                                col_name == 'IDRRef' or 
-                                col_name.endswith('_IDRRef') or 
-                                col_name.endswith('IDRRef')):
-                                idrref_fields.append(col_name)
-                                # Приоритет полю с именем основной таблицы
-                                if col_name == expected_pk_name:
-                                    pk_column = col_name
-                                    break
-                    
-                    # Если не нашли точное совпадение, берем первое найденное поле _IDRRef
-                    if not pk_column and idrref_fields:
-                        pk_column = idrref_fields[0]
-            
-            # Если не нашли поле для табличной части или это не табличная часть,
-            # проверяем стандартные имена для 1С
-            if not pk_column:
-                id_fields = [c['name'] for c in target_columns if c['name'] in ['ID', '_IDRRef', 'IDRRef', '_ID']]
-                if id_fields:
-                    pk_column = id_fields[0]
-                else:
-                    # В последнюю очередь ищем любое поле, заканчивающееся на _IDRRef
-                    idrref_fields = []
-                    for col in target_columns:
-                        col_name = col['name']
-                        col_type = col['data_type']
-                        col_max_length = col.get('max_length')
-                        
-                        if col_type in ['binary', 'varbinary'] and col_max_length == 16:
-                            if (col_name == '_IDRRef' or 
-                                col_name == 'IDRRef' or 
-                                col_name.endswith('_IDRRef') or 
-                                col_name.endswith('IDRRef')):
-                                idrref_fields.append(col_name)
-                    
-                    if idrref_fields:
-                        pk_column = idrref_fields[0]
-                    else:
-                        pk_column = 'ID'  # По умолчанию (может вызвать ошибку, но лучше чем ничего)
+        pk_column = self._resolve_pk_column_for_join(target_table)
         
         # Определяем тип JOIN из конфигурации (по умолчанию INNER JOIN)
         join_type = "INNER JOIN"
