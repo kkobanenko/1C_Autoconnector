@@ -115,6 +115,7 @@ def save_store(path: Path, data: dict) -> None:
 def merge_updates(
     existing: dict,
     updates: Dict[str, dict],
+    db_signature: Optional[str] = None,
 ) -> dict:
     """
     Возвращает новый store: копия existing, в by_table для каждого ключа из updates
@@ -123,13 +124,18 @@ def merge_updates(
     updates: table_name -> запись вида success или error:
       успех: {"assessed_at": iso, "ok": True, "result": assessment_dict}
       ошибка: {"assessed_at": iso, "ok": False, "error_message": str}
+
+    Если передан db_signature, он записывается в каждую обновлённую запись.
     """
     data = {
         "version": existing.get("version", STORE_VERSION),
         "by_table": dict(existing.get("by_table") or {}),
     }
     for tname, entry in updates.items():
-        data["by_table"][tname] = dict(entry)
+        new_entry = dict(entry)
+        if db_signature:
+            new_entry["db_signature"] = db_signature
+        data["by_table"][tname] = new_entry
     return data
 
 
@@ -199,12 +205,27 @@ def build_rows_from_store(
     store: dict,
     human_name_fn: Callable[[str], Optional[str]],
     favorites: Dict[str, Any],
+    db_signature: Optional[str] = None,
+    legacy_allowed_tables: Optional[set[str]] = None,
 ) -> List[dict]:
-    """Список строк по всем ключам by_table (для DataFrame)."""
+    """
+    Список строк по ключам by_table (для DataFrame).
+
+    Если db_signature задан, включаются:
+    - записи с тем же db_signature;
+    - legacy-записи без db_signature только если их таблица в legacy_allowed_tables
+      (мягкая совместимость со старым форматом без межбазового «засорения»).
+    """
     by_table = store.get("by_table") or {}
     rows: List[dict] = []
     for tname in sorted(by_table.keys(), key=lambda x: x.lower()):
         entry = by_table[tname]
+        if db_signature:
+            entry_sig = entry.get("db_signature")
+            if entry_sig and entry_sig != db_signature:
+                continue
+            if not entry_sig and legacy_allowed_tables is not None and tname not in legacy_allowed_tables:
+                continue
         is_fav = tname in favorites
         rows.append(row_for_table(tname, entry, human_name_fn, is_fav))
     return rows

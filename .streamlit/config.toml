@@ -3,6 +3,8 @@ port = 8512
 address = "0.0.0.0"
 enableCORS = false
 enableXsrfProtection = false
+# Лимит размера WebSocket-сообщения (МБ). По умолчанию 200; большой ext-SQL может превышать — иначе MessageSizeError.
+maxMessageSize = 512
 
 [theme]
 primaryColor = "#1f77b4"

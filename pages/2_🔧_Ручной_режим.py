@@ -7,7 +7,6 @@
 import streamlit as st
 import io
 from pathlib import Path
-import traceback
 import json
 
 import sys
@@ -17,7 +16,11 @@ from parsers.structure_parser import StructureParser
 from db.structure_analyzer import StructureAnalyzer
 from builders.relationship_builder import RelationshipBuilder
 from generators.view_generator import ViewGenerator
-from utils.db_connection import test_connection, get_connection_string_from_params
+from utils.db_connection import (
+    test_connection_details,
+    get_connection_string_from_params,
+    get_connection_error_info,
+)
 from utils.sidebar_context import render_context_sidebar
 import config
 
@@ -25,6 +28,32 @@ import config
 st.title("🔧 Ручной режим")
 st.caption("Исходный интерфейс с полным контролем над всеми параметрами генерации.")
 st.markdown("---")
+
+
+def _render_connection_error(info: dict, prefix: str = "Не удалось подключиться.") -> None:
+    """Показывает человеку понятное сообщение об ошибке подключения."""
+    if not info:
+        st.error(prefix)
+        return
+    st.error(f"{prefix} {info.get('message', '')}".strip())
+    if info.get("hint"):
+        st.caption(info["hint"])
+    if info.get("technical_message"):
+        with st.expander("Техническая деталь", expanded=False):
+            st.code(info["technical_message"])
+
+
+def _handle_runtime_db_error(exc: Exception, action_text: str) -> None:
+    """Сбрасывает статус подключения, если БД стала недоступна уже после успешной проверки."""
+    info = get_connection_error_info(exc)
+    st.session_state.connection_tested = False
+    st.session_state.connection_string = None
+    st.session_state.manual_connection_error = info
+    _render_connection_error(
+        info,
+        prefix=f"Не удалось {action_text}. Подключение больше не считается активным.",
+    )
+    st.warning("Проверьте параметры подключения и повторите попытку.")
 
 # Инициализация session state
 if 'connection_string' not in st.session_state:
@@ -47,6 +76,8 @@ if 'structure_parser' not in st.session_state:
     st.session_state.structure_parser = None
 if 'fact_table_db' not in st.session_state:
     st.session_state.fact_table_db = None
+if 'manual_connection_error' not in st.session_state:
+    st.session_state.manual_connection_error = None
 
 
 # Секция подключения к БД
@@ -105,25 +136,31 @@ if db_host and db_database and db_username and db_password:
             db_host, db_database, db_username, db_password
         )
         with st.spinner("Проверка подключения к базе данных..."):
-            success, message = test_connection(connection_string)
+            success, info = test_connection_details(connection_string)
         if success:
-            st.success(f"✅ {message}")
+            st.success(f"✅ {info['message']}")
             st.session_state.connection_string = connection_string
             st.session_state.connection_tested = True
+            st.session_state.manual_connection_error = None
         else:
-            st.error(f"❌ {message}")
+            _render_connection_error(info)
             st.session_state.connection_string = None
             st.session_state.connection_tested = False
+            st.session_state.manual_connection_error = info
         st.session_state['_last_cred_key'] = _cred_key
     else:
         # Credentials не менялись — показываем сохранённый статус
         if st.session_state.connection_tested:
             st.success("✅ Подключение активно")
         else:
-            st.error("❌ Подключение не удалось. Проверьте параметры.")
+            _render_connection_error(
+                st.session_state.get("manual_connection_error"),
+                prefix="Последняя попытка подключения завершилась ошибкой.",
+            )
 else:
     st.warning("⚠️ Заполните все поля для подключения к базе данных.")
     st.session_state.connection_tested = False
+    st.session_state.connection_string = None
 
 st.markdown("---")
 
@@ -183,7 +220,13 @@ if st.session_state.connection_tested and st.session_state.connection_string:
         finally:
             a.close()
 
-    _manual_tables = _get_manual_table_list(st.session_state.connection_string)
+    try:
+        _manual_tables = _get_manual_table_list(st.session_state.connection_string)
+    except Exception as exc:
+        _handle_runtime_db_error(exc, "загрузить список таблиц")
+        st.markdown("---")
+        render_context_sidebar("manual")
+        st.stop()
 
     def _classify_table_manual(name):
         clean = name.lstrip('_')
@@ -488,8 +531,8 @@ if st.button("🚀 Сгенерировать VIEW", type="primary"):
             
         except Exception as e:
             progress_bar.progress(0)
-            status_text.text(f"❌ Ошибка: {str(e)}")
-            st.error(f"Ошибка при генерации:\n```\n{traceback.format_exc()}\n```")
+            _handle_runtime_db_error(e, "выполнить генерацию")
+            status_text.text("❌ Генерация остановлена из-за ошибки подключения или чтения БД.")
             if 'analyzer' in locals():
                 try:
                     analyzer.close()
@@ -1219,8 +1262,8 @@ if st.session_state.get('graph_built') and st.session_state.get('relationships_c
                     
                 except Exception as e:
                     progress_bar.progress(0)
-                    status_text.text(f"❌ Ошибка: {str(e)}")
-                    st.error(f"Ошибка при генерации:\n```\n{traceback.format_exc()}\n```")
+                    _handle_runtime_db_error(e, "сгенерировать SQL VIEW")
+                    status_text.text("❌ Генерация остановлена из-за ошибки подключения или чтения БД.")
 
 st.markdown("---")
 
