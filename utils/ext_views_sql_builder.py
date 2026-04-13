@@ -109,6 +109,15 @@ def classify_ext_table_type(table_name: str) -> Optional[str]:
     return None
 
 
+def _is_allowed_rf_rt_table(table_name: str) -> bool:
+    """
+    В rf/rt оставляем только ссылки на типы из allowlist:
+    Document, Reference, VT, Enum.
+    Это снижает размер EP и помогает укладываться в лимит.
+    """
+    return classify_ext_table_type(table_name) in {"Document", "Reference", "VT", "Enum"}
+
+
 def _bracket_ident(name: str) -> str:
     """Идентификатор T-SQL в квадратных скобках; ] экранируется как ]]."""
     if name is None:
@@ -188,10 +197,22 @@ def _field_meta_json(
     return _dump_ext_meta_json(payload)
 
 
+def _compact_ref_entry(source_table: str, source_field: str) -> Dict[str, str]:
+    """
+    Компактный элемент ссылки для ext.table_meta:
+    только stt/sft, чтобы экономить место в EP представлений.
+    """
+    return {
+        "source_table_tech": source_table,
+        "source_field_tech": source_field,
+    }
+
+
 def _table_meta_json(
     tech_table: str,
     human_table: Optional[str],
     table_kind: str,
+    refs_to_all: List[Dict[str, str]],
     refs_from_all: List[Dict[str, str]],
     refs_from_note: str = "",
 ) -> str:
@@ -199,6 +220,7 @@ def _table_meta_json(
         "tech_table": tech_table,
         "human_table": human_table or "",
         "table_kind": table_kind,
+        "refs_to": refs_to_all,
         "refs_from": refs_from_all,
     }
     if refs_from_note:
@@ -376,7 +398,11 @@ def build_ext_views_sql(
         incoming_pairs = rev.get(norm_tbl, [])
         _max_in = 500
         refs_from_entries: List[Dict[str, str]] = []
+        refs_from_entries_table: List[Dict[str, str]] = []
         for src_tbl, fld in incoming_pairs[:_max_in]:
+            if not _is_allowed_rf_rt_table(src_tbl):
+                continue
+            refs_from_entries_table.append(_compact_ref_entry(src_tbl, fld))
             refs_from_entries.append(
                 {
                     "source_table_tech": src_tbl,
@@ -395,6 +421,19 @@ def build_ext_views_sql(
         col_aliases_for_ep: List[Tuple[str, str]] = []
 
         fld_map = rel_index.get(norm_tbl, {}) if rel_index else {}
+        refs_to_entries_table: List[Dict[str, str]] = []
+        _seen_rt_pairs: Set[Tuple[str, str]] = set()
+        for src_fld, targets in fld_map.items():
+            if not src_fld:
+                continue
+            for tgt in targets or []:
+                if not _is_allowed_rf_rt_table(tgt):
+                    continue
+                pair = (norm_tbl, src_fld)
+                if pair in _seen_rt_pairs:
+                    continue
+                _seen_rt_pairs.add(pair)
+                refs_to_entries_table.append(_compact_ref_entry(norm_tbl, src_fld))
 
         for col in cols:
             cname = col.get("name") or ""
@@ -424,6 +463,8 @@ def build_ext_views_sql(
                 refs_to_entries: List[Dict[str, str]] = []
                 if cname in fld_map:
                     for tgt in fld_map[cname]:
+                        if not _is_allowed_rf_rt_table(tgt):
+                            continue
                         refs_to_entries.append(
                             {
                                 "source_table_tech": norm_tbl,
@@ -460,7 +501,12 @@ def build_ext_views_sql(
         lines.append("")
 
         tbl_meta = _table_meta_json(
-            norm_tbl, human_tbl, kind, refs_from_entries, refs_from_note=refs_from_note
+            norm_tbl,
+            human_tbl,
+            kind,
+            refs_to_entries_table,
+            refs_from_entries_table,
+            refs_from_note=refs_from_note,
         )
         add_ep_object("ext", "VIEW", view_name_short, "ext.table_meta", tbl_meta)
 

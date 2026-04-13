@@ -13,7 +13,7 @@
 - **Секция 10:** автоматические сценарии заполнения конфигурации связей и полей (`utils/config_scenarios.py`) — в том числе вариант без самоссылок по рёбрам графа
 - **Секция 10:** навигация по ссылочным полям с подсказкой пути от корневой таблицы
 - **После загрузки структуры (.docx):** построение SQL для схемы **ext** в MSSQL (представления Document/Reference/VT/Enum, метаданные в extended properties) — блок «Набор представлений ext»: прогресс, скачивание/копирование без вывода огромного текста в UI
-- **ext (детали скрипта):** пакеты `GO` для SSMS/sqlcmd, JSON с короткими ключами и глоссарием в комментариях, `ext.field_meta` только для ref16; для EP один раз `DECLARE @ep_value nvarchar(3750)`, перед каждым add/update — `SET @ep_value = N'...'`, в `sp_*` — `@value = @ep_value`
+- **ext (детали скрипта):** пакеты `GO` для SSMS/sqlcmd, JSON с короткими ключами и глоссарием в комментариях; для экономии места `ext.table_meta` хранит `rf/rt` в компактном виде (`stt`,`sft`), а `ext.field_meta` (только для ref16) сохраняет расширенные ссылки; для EP один раз `DECLARE @ep_value nvarchar(3750)`, перед каждым add/update — `SET @ep_value = N'...'`, в `sp_*` — `@value = @ep_value`
 - **Избранные таблицы (секция 5):** хранятся и отображаются строго по текущей паре `server|database` (`favorites_by_db` в `output/ui_state.json`), без подмешивания набора из другой БД
 - **Подключение (секция 1):** восстанавливаются значения последней ручной сессии (источник credentials, host, database, username, password)
 - CLI интерфейс для автоматизации
@@ -89,7 +89,7 @@ Curproject05_1cViews/
 │   ├── guid_index_visualizer.py
 │   ├── sidebar_context.py   # Боковая панель «Контекст»
 │   ├── config_scenarios.py  # Автосценарии шага 10 (конфиг связей и полей)
-│   └── ext_views_sql_builder.py  # SQL: схема ext, VIEW, GO, EP (short-keys JSON; field_meta только ref16; @ep_value)
+│   └── ext_views_sql_builder.py  # SQL: схема ext, VIEW, GO, EP (table_meta rf/rt=stt,sft; field_meta ref16; @ep_value)
 ├── analyzers/            # Оценка таблиц фактов (мастер)
 ├── pages/                # Страницы Streamlit (мультипейдж)
 ├── input/                # Входные файлы (в т.ч. Структура.docx; не в репозитории)
@@ -133,7 +133,7 @@ python bump_version.py
 
 ## Примечания
 
-- Для набора **ext** JSON в `extended properties` задаётся через переменную **`@ep_value nvarchar(3750)`** (`DECLARE` один раз, перед каждым свойством — `SET @ep_value = N'...'`, в вызовах — `@value = @ep_value`; длина JSON до 3750 символов на свойство)
+- Для набора **ext** JSON в `extended properties` задаётся через переменную **`@ep_value nvarchar(3750)`** (`DECLARE` один раз, перед каждым свойством — `SET @ep_value = N'...'`, в вызовах — `@value = @ep_value`; длина JSON до 3750 символов на свойство). Для экономии объёма `ext.table_meta` хранит `rf/rt` как компактные пары `stt`+`sft`, без расширенных полей.
 - Для устранения исторического загрязнения избранного между БД применяется одноразовая очистка UI-сегмента текущей сигнатуры (`favorites_cleanup_v2_applied` в `output/ui_state.json`)
 - Таблицы в БД могут иметь префикс подчеркивания (`_Document653`) в зависимости от схемы
 - Поля типа `binary(16)` используются для связей и по умолчанию не попадают в SELECT (настраивается в мастере)
